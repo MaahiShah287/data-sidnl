@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.env.*
+!.env.example
+.venv
+env/
+venv/
+ENV/
+*.log
+landing/*/*.*
+!landing/*/.gitkeep
+landing/*/_done/
+landing/*/_failed/
+logs/*.log
+
+# RAG chatbot
+.pytest_cache/
+chroma_db/
+reports/
+rag/.env
+rag/.env.*
+!rag/.env.example

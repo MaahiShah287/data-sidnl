@@ -1,0 +1,19 @@
+# canonical field -> column name in that platform's file. EDIT to match your real headers.
+defaults:
+  store_raw: true            # keep the untouched source row as jsonb (set false to cut storage ~40%)
+  true_values: ["1", "true", "yes", "y", "in stock", "available", "instock"]
+platforms:
+  blinkit:
+    columns: {platform_product_id: product_id, name: name, brand: brand, size: unit, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}
+  zepto:
+    columns: {platform_product_id: product_id, name: name, brand: brand, size: unit, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}
+  instamart:
+    columns: {platform_product_id: product_id, name: name, brand: brand, size: unit, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}
+  bigbasket:
+    columns: {platform_product_id: product_id, name: name, brand: brand, size: unit, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}
+  amazon:
+    columns: {platform_product_id: asin, name: title, brand: brand, size: unit, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}
+  flipkart_minutes:
+    columns: {platform_product_id: product_id, name: name, brand: brand, size: unit, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}
+  myntra:
+    columns: {platform_product_id: style_id, name: name, brand: brand, size: size, category: category, url: url, price: price, mrp: mrp, in_stock: in_stock, observed_at: scraped_at}

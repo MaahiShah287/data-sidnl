@@ -1,0 +1,267 @@
+metrics:
+
+  - name: observed_in_stock_rate
+    status: draft
+    definition: >
+      count(availability = true) / count(availability IS NOT NULL)
+      on silver.v_latest_observation.
+      NULL availability rows are EXCLUDED from both numerator and denominator.
+      OPEN QUESTION: Confirm with analytics mentor whether NULL should be a
+      separate bucket or excluded entirely.
+    source_view: silver.v_latest_observation
+    sql_template: |
+      SELECT
+        platform,
+        city,
+        {brand_filter}
+        {category_filter}
+        COUNT(*) FILTER (WHERE availability = true)                   AS in_stock_count,
+        COUNT(*) FILTER (WHERE availability IS NOT NULL)              AS denominator,
+        ROUND(
+          COUNT(*) FILTER (WHERE availability = true)::numeric /
+          NULLIF(COUNT(*) FILTER (WHERE availability IS NOT NULL), 0) * 100,
+        2) AS in_stock_rate_pct,
+        MIN(observed_at) AS observed_at_min,
+        MAX(observed_at) AS observed_at_max
+      FROM silver.v_latest_observation
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY platform, city {group_by_extra}
+      ORDER BY platform, city
+    grain: platform × city × (optional brand/category)
+    required_filters:
+      - platform (optional; omit for all platforms)
+      - city or store_id (optional)
+    open_questions:
+      - Should NULL availability be its own bucket (e.g. 'unknown') rather than excluded?
+      - Confirm denominator definition with analytics mentor before marking approved.
+
+  - name: observed_oos_rate
+    status: draft
+    definition: >
+      1 − observed_in_stock_rate. Same denominator (excludes NULL availability).
+    source_view: silver.v_latest_observation
+    sql_template: |
+      SELECT
+        platform,
+        city,
+        ROUND(
+          COUNT(*) FILTER (WHERE availability = false)::numeric /
+          NULLIF(COUNT(*) FILTER (WHERE availability IS NOT NULL), 0) * 100,
+        2) AS oos_rate_pct,
+        MIN(observed_at) AS observed_at_min,
+        MAX(observed_at) AS observed_at_max
+      FROM silver.v_latest_observation
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY platform, city {group_by_extra}
+      ORDER BY platform, city
+    grain: platform × city × (optional brand/category)
+    required_filters: []
+    open_questions:
+      - Inherits the NULL-availability open question from observed_in_stock_rate.
+
+  - name: avg_discount_pct
+    status: draft
+    definition: >
+      avg(discount_percentage) where mrp > 0, using simple average.
+      OPEN QUESTION: Should this be weighted (e.g. by listing count or inventory)?
+    source_view: silver.v_latest_observation
+    sql_template: |
+      SELECT
+        platform,
+        city,
+        {brand_filter}
+        ROUND(AVG(discount_percentage), 2) AS avg_discount_pct,
+        COUNT(*) AS listing_count,
+        MIN(observed_at) AS observed_at_min,
+        MAX(observed_at) AS observed_at_max
+      FROM silver.v_latest_observation
+      WHERE mrp > 0
+        AND discount_percentage IS NOT NULL
+        {where_clauses}
+      GROUP BY platform, city {group_by_extra}
+      ORDER BY platform, city
+    grain: platform × city × (optional brand/category)
+    required_filters: []
+    open_questions:
+      - Weighted vs simple average — confirm with analytics mentor.
+
+  - name: current_price
+    status: draft
+    definition: >
+      Latest sale_price and mrp per listing and store from silver.v_latest_observation.
+    source_view: silver.v_latest_observation
+    sql_template: |
+      SELECT
+        platform,
+        product_name,
+        sku_name,
+        brand,
+        city,
+        store_name,
+        mrp,
+        sale_price,
+        discount_percentage,
+        currency,
+        observed_at
+      FROM silver.v_latest_observation
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY platform, city, product_name
+    grain: platform × listing × store
+    required_filters:
+      - product_name or brand (at least one recommended to limit result set)
+    open_questions: []
+
+  - name: ad_placement_rate
+    status: draft
+    definition: >
+      count(*) FILTER (WHERE is_ad = true) / count(*) on silver.v_latest_shelf_position.
+    source_view: silver.v_latest_shelf_position
+    sql_template: |
+      SELECT
+        platform,
+        city,
+        {category_filter}
+        COUNT(*) FILTER (WHERE is_ad = true)              AS ad_count,
+        COUNT(*)                                           AS total_count,
+        ROUND(
+          COUNT(*) FILTER (WHERE is_ad = true)::numeric /
+          NULLIF(COUNT(*), 0) * 100,
+        2) AS ad_placement_rate_pct,
+        MIN(observed_at) AS observed_at_min,
+        MAX(observed_at) AS observed_at_max
+      FROM silver.v_latest_shelf_position
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY platform, city {group_by_extra}
+      ORDER BY platform, city
+    grain: platform × city × (optional category)
+    required_filters: []
+    open_questions:
+      - Confirm whether is_ad in observation rows should also count (currently only shelf_position).
+
+  - name: avg_organic_position
+    status: draft
+    definition: >
+      avg(organic_position) per brand and category from silver.v_latest_shelf_position.
+      NULL organic_position rows are excluded.
+    source_view: silver.v_latest_shelf_position
+    sql_template: |
+      SELECT
+        platform,
+        city,
+        brand,
+        l1_category,
+        ROUND(AVG(organic_position), 2) AS avg_organic_position,
+        COUNT(*) AS listing_count,
+        MIN(observed_at) AS observed_at_min,
+        MAX(observed_at) AS observed_at_max
+      FROM silver.v_latest_shelf_position
+      WHERE organic_position IS NOT NULL
+        {where_clauses}
+      GROUP BY platform, city, brand, l1_category {group_by_extra}
+      ORDER BY platform, city, avg_organic_position
+    grain: platform × city × brand × l1_category
+    required_filters: []
+    open_questions: []
+
+  - name: cross_platform_price_gap
+    status: unsupported
+    definition: >
+      Requires a product-matching layer to identify the same SKU across platforms.
+      Not yet built. Per-platform prices are available via current_price.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions:
+      - When will the product-matching layer be ready?
+
+  - name: SOV
+    status: unsupported
+    definition: >
+      Share of Voice. Company definition pending — not yet agreed.
+      The chatbot will respond "SOV definition is pending" until this is resolved.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions:
+      - Company definition needed. Owner: product/analytics lead.
+
+  - name: SOH
+    status: unsupported
+    definition: >
+      Share of Shelf. Company definition pending — not yet agreed.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions:
+      - Company definition needed. Owner: product/analytics lead.
+
+  - name: sales
+    status: unsupported
+    definition: Sales data is not available in the SIDNL silver layer.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []
+
+  - name: revenue
+    status: unsupported
+    definition: Revenue data is not available in the SIDNL silver layer.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []
+
+  - name: ad_spend
+    status: unsupported
+    definition: Ad spend data is not available in the SIDNL silver layer.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []
+
+  - name: ROAS
+    status: unsupported
+    definition: >
+      Return on Ad Spend. Neither ad spend nor sales are available in the data.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []
+
+  - name: conversion
+    status: unsupported
+    definition: Conversion data (clicks, orders) is not available in the silver layer.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []
+
+  - name: clicks
+    status: unsupported
+    definition: Click data is not available in the SIDNL silver layer.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []
+
+  - name: impressions
+    status: unsupported
+    definition: Impression data is not available in the SIDNL silver layer.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions: []

@@ -1,0 +1,114 @@
+erDiagram
+    brand_scope ||--o{ dim_brand : "scopes"
+    dim_platform ||--o{ dim_product : "sold on"
+    dim_platform ||--o{ dim_store : "operates"
+    dim_brand ||--o{ dim_product : "owns"
+    dim_category ||--o{ dim_product : "classifies"
+    dim_city ||--o{ dim_store : "located in"
+    dim_product ||--o{ fact_product_reading : "observed"
+    dim_store ||--o{ fact_product_reading : "at store"
+    dim_store ||--o{ fact_store_scan : "scanned"
+    dim_brand ||--o{ fact_store_scan : "for brand"
+    fact_store_scan ||--o{ fact_product_reading : "snapshot_id"
+    etl_run ||--o{ fact_product_reading : "loaded by"
+    freshness_policy ||--o{ fact_product_reading : "ages by source_type"
+
+    brand_scope {
+        text brand_key PK
+        text brand_name
+        text_arr raw_brand_aliases
+        bool is_enabled
+    }
+    dim_platform {
+        text platform PK
+        bool is_test
+    }
+    dim_city {
+        text city_slug PK
+        text city_name
+        text state
+    }
+    dim_brand {
+        text brand_key PK
+        text brand_name
+        text company_name
+    }
+    dim_store {
+        bigint store_key PK
+        text platform
+        text store_external_id
+        bigint source_store_id UK
+        text store_name
+        text city_slug FK
+        numeric latitude
+        numeric longitude
+    }
+    dim_category {
+        bigint category_key PK
+        text l1_name
+        text l2_name
+        text l3_name
+        text category_path
+    }
+    dim_product {
+        bigint product_key PK
+        text platform
+        text platform_product_id
+        text brand_key FK
+        text product_name
+        text variant
+        text product_type
+        text pack_raw
+        numeric size_value
+        text size_unit
+        int pack_count
+        numeric total_content
+        bigint category_key FK
+    }
+    fact_store_scan {
+        bigint snapshot_id PK
+        text platform
+        text brand_key
+        bigint store_key FK
+        timestamptz scanned_at
+        text scan_status
+        bool stopped_early
+        bool is_valid_denominator
+    }
+    fact_product_reading {
+        bigint reading_key PK
+        text source_type
+        text source_record_id UK
+        bigint product_key FK
+        bigint store_key FK
+        bigint snapshot_id FK
+        timestamptz observed_at
+        date obs_date
+        text stock_status
+        bool is_listed
+        bool is_available
+        int inventory_units
+        numeric selling_price
+        numeric mrp
+        numeric discount_pct
+        int search_position
+        bool is_ad
+        bool osa_eligible
+        text dq_status
+        text_arr dq_flags
+    }
+    freshness_policy {
+        text source_type PK
+        int fresh_within_hours
+    }
+    etl_run {
+        bigint run_id PK
+        text brand_key
+        text status
+        jsonb stats
+    }
+    ref_metric_support {
+        int metric_id PK
+        text metric
+        text support
+    }
