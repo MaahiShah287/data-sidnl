@@ -171,7 +171,7 @@ def run_profile(conn) -> dict[str, Any]:
 
     # ---- 5. Cross source-type overlap ----
     union_all_src = " UNION ALL ".join(
-        f"SELECT platform, COALESCE(listing_id, platform_product_id) AS eid, store_id, source_type FROM silver.{p}"
+        f"SELECT platform, COALESCE(listing_id::text, platform_product_id) AS eid, store_id, source_type FROM silver.{p}"
         for p in PLATFORMS
     )
     data["overlap"] = q(conn, f"""
