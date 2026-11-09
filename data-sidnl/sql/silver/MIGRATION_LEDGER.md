@@ -50,6 +50,7 @@ Method: md5 of the live `statements` text vs md5 of the repo/exported file. No m
 | 20261107200119 | silver_042_storage_alerts | c5dda22df9eb49e55a1599e36635fd03 | COMMENTS-ONLY |
 | 20261107201340 | silver_043_cron_health_view | 9eca632f45e2b34c8f43c5324efc7035 | COMMENTS-ONLY (view superseded by 044, still live-ordered) |
 | 20261107202823 | silver_044_cron_failure_alert | df8d9f847d3be85acf269777eb18a198 | COMMENTS-ONLY (comments-stripped c16a3babd60635b68af367d8c0da2209) |
+| 20261109065005 | silver_050_views_security_invoker | 0cbfb42fcb58e2716d2b78010ae5789e | EXACT (`live/20261109065005_silver_050_views_security_invoker.sql`; applied 2026-11-09; rollback `050_rollback.sql`) |
 
 Full authoritative list with md5 for every row: run `ledger_verify.sql` (below) — it regenerates this table from the live database.
 
@@ -69,7 +70,7 @@ Two caveats: (a) function *names* appearing in migration text does not prove the
 **New environment (empty database):** do NOT replay by filename. Use the live history order (versions above). Apply in version order the exact live statements; for 026+ use the numbered files (header comments are harmless). `live/` files fill the gaps (001b, 001c, 010, 021b, 021c, 023a, 023b, category_market_shelf). 020/021 must be applied as the live text (export with the query below), not the repo copies.
 **Existing production:** nothing to deploy. Commit `sql_silver/*.sql`, `sql_silver/live/*.sql`, rollbacks and this ledger to the repo; no database change is needed.
 **Applying a future migration:** `apply_migration` with name `silver_NNN_slug` → export statements → add to repo with the same number → record md5 here.
-**Rollback order (newest first):** 044 → 043 → 042 → 041 → 040 → 039 → 038 → 037 → 036 (each `NNN_rollback.sql`; 041 restores from `silver.function_backup` tag `pre_041`, 042 drops only additive objects).
+**Rollback order (newest first):** 050 → 044 → 043 → 042 → 041 → 040 → 039 → 038 → 037 → 036 (each `NNN_rollback.sql`; 041 restores from `silver.function_backup` tag `pre_041`, 042 drops only additive objects).
 
 ## ledger_verify.sql (run anytime; read-only)
 ```sql

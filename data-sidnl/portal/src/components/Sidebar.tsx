@@ -3,21 +3,15 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard, TrendingUp, Package, Tag, CheckCircle,
-  Star, Grid, MapPin, Users, AlertTriangle, BarChart2
+  Eye
 } from 'lucide-react';
 import clsx from 'clsx';
 
 const NAV = [
   { href: '/',              label: 'Overview',      icon: LayoutDashboard },
-  { href: '/platform',     label: 'Platform',      icon: BarChart2 },
-  { href: '/products',     label: 'Products / SKU', icon: Package },
-  { href: '/pricing',      label: 'Pricing',       icon: Tag },
   { href: '/availability', label: 'Availability',  icon: CheckCircle },
-  { href: '/brands',       label: 'Brands',        icon: Star },
-  { href: '/categories',   label: 'Category / Shelf', icon: Grid },
-  { href: '/geography',    label: 'Geography',     icon: MapPin },
-  { href: '/competitors',  label: 'Competitors',   icon: Users },
-  { href: '/rca',          label: 'RCA',           icon: AlertTriangle },
+  { href: '/pricing',      label: 'Pricing',       icon: Tag },
+  { href: '/visibility',   label: 'Visibility',    icon: Eye },
 ];
 
 export default function Sidebar() {
@@ -30,7 +24,7 @@ export default function Sidebar() {
           <TrendingUp className="w-5 h-5 text-blue-600" />
           <span className="font-bold text-slate-800 text-sm">SIDNL Analytics</span>
         </div>
-        <p className="text-xs text-slate-400 mt-0.5">Gold Layer · Live Data</p>
+        <p className="text-xs text-slate-400 mt-0.5">Silver → Dash · Live</p>
       </div>
 
       {/* Nav */}

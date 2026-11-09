@@ -1,26 +1,10 @@
-"""Silver layer runner: apply SQL, refresh a brand from bronze, report freshness / DQ, run parser self-test.
+"""Silver helpers. The pipeline itself runs inside Supabase (pg_cron -> silver.run_tick); this is only for checking it.
 
-Bronze (public.*)  ->  silver (star schema, brand-scoped)  ->  gold (sql/gold/*, reads silver.<platform> views)
-All SQL lives in sql/silver/*.sql (numbered, idempotent). Business logic is in Postgres functions
-(silver.parse_pack, silver.reading_dq, silver.refresh_brand ...) so every consumer gets identical parsing.
+Bronze (public.*) -> silver (metric tables only) -> gold. Run history and data-quality results live in schema ops.
 """
 import json
-from .common import ROOT
 
-SILVER_DIR = ROOT / "sql" / "silver"
 DEFAULT_BRAND = "mr munchies"
-
-
-def apply(conn):
-    """Apply sql/silver/NNN_*.sql in order. Safe to re-run (all files are idempotent)."""
-    done = []
-    for f in sorted(SILVER_DIR.glob("[0-9][0-9][0-9]_*.sql")):
-        with conn.cursor() as cur:
-            cur.execute(f.read_text(encoding="utf-8"))
-        conn.commit()
-        done.append(f.name)
-        print("applied", f.name)
-    return done
 
 
 def selftest(conn):
@@ -31,8 +15,18 @@ def selftest(conn):
     return msg
 
 
+def run(conn, force=False):
+    """Run the whole bronze -> silver pipeline now (what cron does every minute). Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute("select silver.run_pipeline(%s, 'manual')", (force,))
+        res = cur.fetchone()[0]
+    conn.commit()
+    print(json.dumps({k: res.get(k) for k in ("status", "mode", "run_id", "gold_status")}, indent=2, default=str))
+    return res
+
+
 def refresh(conn, brand=DEFAULT_BRAND):
-    """Idempotent bronze -> silver load for one brand. Returns the stats dict the SQL function logs to silver.etl_run."""
+    """Idempotent bronze -> silver load for one brand."""
     with conn.cursor() as cur:
         cur.execute("select silver.refresh_brand(%s)", (brand,))
         stats = cur.fetchone()[0]
@@ -42,15 +36,13 @@ def refresh(conn, brand=DEFAULT_BRAND):
 
 
 def report(conn):
-    """Print freshness per source, DQ flags and listing %."""
+    """Pipeline health, data quality and listing %."""
     with conn.cursor() as cur:
-        cur.execute("""select platform, brand_key, source_type, readings, fresh_readings, stale_readings,
-                              hours_since_last_reading, source_status
-                       from silver.v_data_freshness order by 1,2,3""")
-        print("-- freshness (platform, brand, source, readings, fresh, stale, hours since last, status)")
-        for r in cur.fetchall(): print(*r, sep=" | ")
-        cur.execute("""select dq_status, dq_flag, sum(readings) from silver.v_dq_summary
-                       group by 1,2 order by 1,3 desc""")
+        cur.execute("select * from ops.v_silver_health")
+        cols = [c.name for c in cur.description]
+        print("-- health")
+        for k, v in zip(cols, cur.fetchone()): print(f"{k:32s} {v}")
+        cur.execute("select dq_status, dq_flag, sum(readings) from ops.v_dq_summary group by 1,2 order by 1,3 desc")
         print("-- data quality")
         for r in cur.fetchall(): print(*r, sep=" | ")
         cur.execute("""select product_name, listing_stores, eligible_stores, listing_pct, eligible_stores_stopped_early

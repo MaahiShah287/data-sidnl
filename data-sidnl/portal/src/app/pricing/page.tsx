@@ -1,129 +1,83 @@
-'use client';
-import { useState, useEffect, useCallback } from 'react';
-import { createClient } from '@/lib/supabase';
 import KpiCard from '@/components/KpiCard';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
+import Header, { Empty } from '@/components/Header';
+import { Trend } from '@/components/Charts';
+import { q, pct, n } from '@/lib/db';
 
-export default function PricingPage() {
-  const supabase = createClient();
-  const [current, setCurrent] = useState<any[]>([]);
-  const [parity, setParity] = useState<any[]>([]);
-  const [daily, setDaily] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+export const dynamic = 'force-dynamic';
 
-  const load = useCallback(async () => {
-    setLoading(true); setError(null);
-    try {
-      const [cRes, pRes, dRes] = await Promise.all([
-        supabase.from('v_price_current').select('platform,product_name,brand,l1_category,l2_category,city_slug,mrp,sale_price,discount_pct,discount_amount,availability').schema('gold').limit(200).order('discount_pct', { ascending: false }),
-        supabase.from('mv_price_parity').select('*').schema('gold').order('price_gap', { ascending: false }).limit(50),
-        supabase.from('mv_pricing_daily').select('obs_date,platform,brand,avg_sp,avg_mrp,avg_discount_pct,max_discount_pct').schema('gold').order('obs_date').limit(200),
-      ]);
-      if (cRes.error) throw cRes.error;
-      setCurrent(cRes.data ?? []);
-      setParity(pRes.data ?? []);
-      setDaily(dRes.data ?? []);
-    } catch (e: any) { setError(e.message); }
-    finally { setLoading(false); }
-  }, []);
+export default async function PricingPage() {
+  const [[k], trend, cities, up, down] = await Promise.all([
+    q(`with d as (select max(obs_date) dt from dash.pricing)
+       select dt::text, avg(selling_price)::float8 asp, avg(mrp)::float8 mrp,
+              avg(weighted_discount_pct)::float8 disc, avg(price_per_100g)::float8 p100,
+              count(*) filter (where is_parity_break) breaks, count(*) n
+         from dash.pricing, d where obs_date = d.dt group by dt`),
+    q(`select obs_date::text d, avg(selling_price)::float8 sp, avg(mrp)::float8 mrp, avg(weighted_discount_pct)::float8 disc
+         from dash.pricing group by 1 order by 1`),
+    q(`with d as (select max(obs_date) dt from dash.pricing)
+       select p.platform, p.city_slug, c.city_name, avg(p.selling_price)::float8 sp,
+              min(p.min_selling_price)::float8 lo, max(p.max_selling_price)::float8 hi,
+              avg(p.weighted_discount_pct)::float8 disc, avg(p.price_vs_national_pct)::float8 vs_nat
+         from dash.pricing p left join dash.dim_city c using (city_slug), d
+        where p.obs_date = d.dt group by 1,2,3 order by 1,2`),
+    q(`select s.canonical_name name, p.platform, p.city_slug, p.selling_price::float8 sp, p.sp_change_pct::float8 chg
+         from dash.pricing p join dash.dim_sidnl s using (sidnl_id)
+        where p.sp_change_pct > 0 and p.obs_date = (select max(obs_date) from dash.pricing where sp_change_pct is not null)
+        order by chg desc limit 10`),
+    q(`select s.canonical_name name, p.platform, p.city_slug, p.selling_price::float8 sp, p.sp_change_pct::float8 chg
+         from dash.pricing p join dash.dim_sidnl s using (sidnl_id)
+        where p.sp_change_pct < 0 and p.obs_date = (select max(obs_date) from dash.pricing where sp_change_pct is not null)
+        order by chg limit 10`),
+  ]);
 
-  useEffect(() => { load(); }, [load]);
-
-  const avgDiscount = current.length ? (current.reduce((s, r) => s + (r.discount_pct ?? 0), 0) / current.length).toFixed(1) : null;
-  const maxDiscount = current.length ? Math.max(...current.map(r => r.discount_pct ?? 0)).toFixed(1) : null;
-  const avgSp = current.length ? (current.reduce((s, r) => s + (r.sale_price ?? 0), 0) / current.length).toFixed(0) : null;
+  const Movers = ({ title, rows }: { title: string; rows: any[] }) => (
+    <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+      <h2 className="section-title">{title}</h2>
+      {rows.length === 0 ? <Empty what="No price changes recorded." /> : (
+        <table className="data-table">
+          <thead><tr><th>SKU</th><th>Platform</th><th>City</th><th>SP</th><th>Δ%</th></tr></thead>
+          <tbody>{rows.map((r, i) => (
+            <tr key={i}><td>{r.name}</td><td className="capitalize">{r.platform}</td><td>{r.city_slug}</td>
+              <td>₹{n(r.sp)}</td><td className={r.chg > 0 ? 'text-red-600' : 'text-emerald-600'}>{pct(r.chg)}</td></tr>
+          ))}</tbody>
+        </table>
+      )}
+    </div>
+  );
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-900">Pricing</h1>
-        <p className="text-sm text-slate-500 mt-0.5">MRP, SP, discount %, and cross-platform price parity</p>
-      </div>
-      {error && <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-700">{error}</div>}
-
+      <Header title="Pricing" subtitle="MRP, selling price, discount, parity" />
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <KpiCard title="Avg Selling Price"   value={avgSp ? `₹${avgSp}` : null}  loading={loading} />
-        <KpiCard title="Avg Discount %"      value={avgDiscount} unit="%"          loading={loading} />
-        <KpiCard title="Max Discount %"      value={maxDiscount} unit="%"          loading={loading} badge="Max" badgeColor="red" />
-        <KpiCard title="Multi-platform SKUs" value={parity.length}                 loading={loading} subtitle="Listed on 2+ platforms" />
-        <KpiCard title="Weighted Discount"   value={null} unavailable loading={false} subtitle="No quantity data" />
-        <KpiCard title="Sales Value at MRP"  value={null} unavailable loading={false} subtitle="No transaction data" />
+        <KpiCard title="Avg selling price" value={k?.asp != null ? `₹${n(k.asp)}` : '—'} subtitle={`as of ${k?.dt ?? '—'}`} />
+        <KpiCard title="Avg MRP" value={k?.mrp != null ? `₹${n(k.mrp)}` : '—'} />
+        <KpiCard title="Avg discount" value={pct(k?.disc)} />
+        <KpiCard title="Parity breaks" value={k?.breaks ?? '—'} subtitle={`of ${k?.n ?? 0} SKU-cities`} />
       </div>
 
-      {/* Price parity table */}
-      {parity.length > 0 && (
-        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
-          <h2 className="section-title">Cross-Platform Price Parity</h2>
-          <div className="overflow-x-auto">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Product</th>
-                  <th>Brand</th>
-                  <th>Platforms</th>
-                  <th>Min SP</th>
-                  <th>Max SP</th>
-                  <th>Price Gap</th>
-                  <th>Cheapest Platform</th>
-                </tr>
-              </thead>
-              <tbody>
-                {parity.slice(0, 30).map((r, i) => (
-                  <tr key={i}>
-                    <td className="font-medium max-w-xs truncate">{r.product_name}</td>
-                    <td>{r.brand}</td>
-                    <td>{r.platforms}</td>
-                    <td className="text-emerald-600 font-semibold">₹{r.min_sp_cross_platform}</td>
-                    <td className="text-red-600">₹{r.max_sp_cross_platform}</td>
-                    <td className={r.sp_spread > 20 ? 'text-red-600 font-semibold' : 'text-slate-700'}>
-                      ₹{r.sp_spread}
-                    </td>
-                    <td><span className="badge badge-blue capitalize">{r.cheapest_platform}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+        <h2 className="section-title">Average discount % by day</h2>
+        <Trend data={trend} x="d" series={['disc']} />
+      </div>
 
-      {/* Top discounts table */}
-      {current.length > 0 && (
-        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
-          <h2 className="section-title">Products with Highest Discounts</h2>
-          <div className="overflow-x-auto">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Product</th>
-                  <th>Brand</th>
-                  <th>Category</th>
-                  <th>Platform</th>
-                  <th>MRP</th>
-                  <th>SP</th>
-                  <th>Discount %</th>
-                  <th>Discount ₹</th>
-                </tr>
-              </thead>
-              <tbody>
-                {current.slice(0, 20).map((r, i) => (
-                  <tr key={i}>
-                    <td className="font-medium max-w-xs truncate">{r.product_name}</td>
-                    <td>{r.brand}</td>
-                    <td>{r.l2_category}</td>
-                    <td><span className="badge badge-blue">{r.platform}</span></td>
-                    <td>₹{r.mrp}</td>
-                    <td>₹{r.sale_price}</td>
-                    <td className="font-semibold text-amber-600">{r.discount_pct}%</td>
-                    <td>₹{r.discount_amount}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+      <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+        <h2 className="section-title">City price comparison (latest day)</h2>
+        <div className="overflow-x-auto">
+          <table className="data-table">
+            <thead><tr><th>Platform</th><th>City</th><th>Avg SP</th><th>Lowest</th><th>Highest</th><th>Discount</th><th>Vs national</th></tr></thead>
+            <tbody>{cities.map((r: any) => (
+              <tr key={`${r.platform}-${r.city_slug}`}>
+                <td className="capitalize font-medium">{r.platform}</td><td>{r.city_name ?? r.city_slug}</td>
+                <td>₹{n(r.sp)}</td><td>₹{n(r.lo)}</td><td>₹{n(r.hi)}</td><td>{pct(r.disc)}</td><td>{pct(r.vs_nat)}</td>
+              </tr>))}</tbody>
+          </table>
         </div>
-      )}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Movers title="Biggest price increases" rows={up} />
+        <Movers title="Biggest price decreases" rows={down} />
+      </div>
     </div>
   );
 }

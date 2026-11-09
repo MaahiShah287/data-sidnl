@@ -31,7 +31,6 @@ REVOKE ALL ON silver.blinkit   FROM sidnl_chatbot_ro;
 REVOKE ALL ON silver.zepto     FROM sidnl_chatbot_ro;
 REVOKE ALL ON silver.instamart FROM sidnl_chatbot_ro;
 REVOKE ALL ON silver.jiomart   FROM sidnl_chatbot_ro;
-REVOKE ALL ON silver.demo      FROM sidnl_chatbot_ro;
 
 ALTER ROLE sidnl_chatbot_ro SET statement_timeout = '10s';
 ALTER ROLE sidnl_chatbot_ro SET idle_in_transaction_session_timeout = '30s';

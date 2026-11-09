@@ -2,6 +2,8 @@
 
 ## The idea
 One real-world product = one `sidnl_id` (`SI001`, `SI002`, ... `SI999`, `SI1000`) on every platform.
+Ids are kept strictly **A-Z by product name**: after matching, every run calls `silver.resequence_sidnl()`, so a new product
+shifts the ids after it. Do not store SI ids outside the database; store platform + platform_product_id instead.
 The same product's Blinkit id and Zepto id both point to the same SI id.
 
 ```
@@ -27,12 +29,13 @@ select silver.sidnl_everything('SI001');            -- every silver + gold table
 select * from silver.sidnl_find('<name words>');     -- by name, platform product id, or SI id
 select * from silver.v_sidnl_product;                -- SI id + product id on each platform
 select * from silver.v_reading_by_sidnl where sidnl_id = 'SI001';
+select * from silver.v_shelf_by_sidnl where sidnl_id = 'SI001';   -- category-shelf positions
 ```
 `sidnl_everything` discovers tables from the catalog (any silver/gold base table with `product_key`, or
 `platform` + `platform_product_id`), so new fact and gold tables are included automatically. `p_row_limit`
-(default 1000) caps rows per table; `row_count` is always the true total. Merged/retired ids still resolve.
+(default 1000) caps rows per table; `row_count` is always the true total. Retired ids are dropped at the next re-sort, so ids never resolve to a merged product after that.
 
-## How two listings are matched (port of match.py / normalize.py)
+## How two listings are matched
 | Check | What | Weight |
 |---|---|---|
 | 1 Lexical | name token-set similarity (trigram), brand | 35% + 25% |
@@ -54,7 +57,7 @@ A brand legitimately repeats in the map once per SKU: every flavour x size x pac
 and its own SI id. Use `silver.v_canonical_brand_summary` for brand-level counts. Weights, thresholds, noise words and synonyms live in `sidnl_config`, `ref_noise_word`,
 `ref_variant_synonym`: edit rows, no deploy.
 
-Deviation from `match.py`: when only one side has a category the category score is neutral (0.5), not 0.
+When only one side has a category the category score is neutral (0.5), not 0.
 "Semantic" means these meaning checks; there are no embeddings (RAG is out of scope for now).
 
 ## Review
@@ -78,8 +81,8 @@ successful run. A minimum gap of `pipeline_min_interval_seconds` (600) separates
 (`silver.run_pipeline(true)`) happens daily at 00:05 IST so date-based gold tables roll over.
 
 ```sql
-select * from silver.v_pipeline_status;      -- health
-select * from silver.pipeline_run order by run_id desc limit 5;   -- per-step timings and errors
+select * from ops.v_pipeline_status;      -- health
+select * from ops.pipeline_run order by run_id desc limit 5;   -- per-step timings and errors
 select silver.run_pipeline(true);            -- run now
 select cron.unschedule('sidnl-pipeline');    -- pause automation
 select * from silver.selftest_matcher();     -- matcher tests, every row must be ok = true
@@ -101,5 +104,4 @@ row is created by the next run; its products then flow through parsing, SI ids a
   the oldest id, `platform_id_aliases` lists all. `silver.merge_canonical` still refuses same-platform merges.
 - Only Blinkit is loaded, so every SI id currently has one platform. The cross-platform path has not yet run on
   real data; it will the first time a second platform's products land in `dim_product`.
-- Add spelling variants you actually see across platforms to `silver.ref_variant_synonym`; none are pre-seeded
-  beyond `config/matching.yaml`.
+- Add spelling variants you actually see across platforms to `silver.ref_variant_synonym`; none are pre-seeded.

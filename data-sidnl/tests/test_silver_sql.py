@@ -1,12 +1,18 @@
-"""Silver parser/DQ tests run inside Postgres (the functions live there). Skipped without SUPABASE_DB_URL."""
+"""Two smoke tests against the live silver DB. Skipped without SUPABASE_DB_URL.
+Run: python -m unittest discover -s tests -v
+"""
 import os, unittest
 
 
+def _connect():
+    from sidnl.common import connect
+    return connect()
+
+
 @unittest.skipUnless(os.environ.get("SUPABASE_DB_URL"), "SUPABASE_DB_URL not set")
-class SilverSql(unittest.TestCase):
+class SilverSmoke(unittest.TestCase):
     def test_parser_selftest(self):
-        from sidnl.common import connect
-        conn = connect()
+        conn = _connect()
         try:
             with conn.cursor() as cur:
                 cur.execute("select silver.selftest_parser()")
@@ -14,16 +20,16 @@ class SilverSql(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_refresh_is_idempotent(self):
-        from sidnl.common import connect
-        conn = connect()
+    def test_every_row_has_a_sidnl_id(self):
+        """Bronze -> silver is automatic; every product, reading and shelf row must resolve to a SI id."""
+        conn = _connect()
         try:
             with conn.cursor() as cur:
-                cur.execute("select count(*) from silver.fact_product_reading"); before = cur.fetchone()[0]
-                cur.execute("select silver.refresh_brand('mr munchies')")
-                cur.execute("select count(*) from silver.fact_product_reading"); after = cur.fetchone()[0]
-            conn.rollback()
-            self.assertGreaterEqual(after, before)
+                for table in ("dim_product", "fact_product_reading", "fact_shelf_position"):
+                    cur.execute(
+                        f"select count(*) from silver.{table} t "
+                        "left join silver.product_xref x using (product_key) where x.sidnl_id is null")
+                    self.assertEqual(cur.fetchone()[0], 0, f"{table} has rows without a sidnl_id")
         finally:
             conn.close()
 

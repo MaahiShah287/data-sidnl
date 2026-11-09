@@ -2,6 +2,7 @@ erDiagram
     brand_scope ||--o{ dim_brand : "scopes"
     dim_platform ||--o{ dim_product : "sold on"
     dim_platform ||--o{ dim_store : "operates"
+    dim_platform ||--o{ category_scope : "loads"
     dim_brand ||--o{ dim_product : "owns"
     dim_category ||--o{ dim_product : "classifies"
     dim_city ||--o{ dim_store : "located in"
@@ -9,9 +10,17 @@ erDiagram
     dim_store ||--o{ fact_product_reading : "at store"
     dim_store ||--o{ fact_store_scan : "scanned"
     dim_brand ||--o{ fact_store_scan : "for brand"
-    fact_store_scan ||--o{ fact_product_reading : "snapshot_id"
-    etl_run ||--o{ fact_product_reading : "loaded by"
     freshness_policy ||--o{ fact_product_reading : "ages by source_type"
+    category_scope ||--o{ fact_shelf_position : "scopes"
+    dim_product ||--o{ fact_shelf_position : "matched product"
+    dim_store ||--o{ fact_shelf_position : "at store"
+    dim_city ||--o{ fact_shelf_position : "in city"
+    canonical_product ||--o{ product_xref : "owns SI id"
+    dim_product ||--o| product_xref : "maps to"
+    dim_product ||--o{ match_review_queue : "reviewed product"
+    canonical_product ||--o{ match_review_queue : "suggested match"
+    ops_etl_run ||--o{ fact_product_reading : "loaded by"
+    ops_etl_run ||--o{ fact_shelf_position : "loaded by"
 
     brand_scope {
         text brand_key PK
@@ -65,6 +74,39 @@ erDiagram
         numeric total_content
         bigint category_key FK
     }
+    canonical_product {
+        text sidnl_id PK
+        text brand_key FK
+        text canonical_name
+        text variant
+        numeric size_value
+        text size_unit
+        int pack_count
+        bool is_active
+        text merged_into FK
+    }
+    product_xref {
+        int product_key PK,FK
+        text sidnl_id FK
+        text match_status
+        text match_method
+        numeric score
+    }
+    match_review_queue {
+        bigint review_id PK
+        int product_key FK
+        text suggested_sidnl_id FK
+        numeric score
+        text status
+    }
+    category_scope {
+        text platform PK,FK
+        text l1_id PK
+        text l2_id PK
+        text l1_name
+        text l2_name
+        bool is_enabled
+    }
     fact_store_scan {
         bigint snapshot_id PK
         text platform
@@ -81,7 +123,7 @@ erDiagram
         text source_record_id UK
         bigint product_key FK
         bigint store_key FK
-        bigint snapshot_id FK
+        bigint snapshot_id
         timestamptz observed_at
         date obs_date
         text stock_status
@@ -97,11 +139,29 @@ erDiagram
         text dq_status
         text_arr dq_flags
     }
+    fact_shelf_position {
+        bigint shelf_pos_key PK
+        bigint source_record_id UK
+        bigint snapshot_id
+        text platform FK
+        text l1_id
+        text l2_id
+        int product_key FK
+        int store_key FK
+        text city_slug FK
+        timestamptz observed_at
+        date obs_date
+        int shelf_position
+        text brand_key
+        numeric selling_price
+        numeric mrp
+        text dq_status
+    }
     freshness_policy {
         text source_type PK
         int fresh_within_hours
     }
-    etl_run {
+    ops_etl_run {
         bigint run_id PK
         text brand_key
         text status

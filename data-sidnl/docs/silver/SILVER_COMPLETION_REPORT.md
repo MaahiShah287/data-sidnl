@@ -1,5 +1,11 @@
 # Silver completion report — for review (Silver only; Gold not developed)
 
+> Historical status report. Its scope predates Silver migrations 045–055 and
+> Gold migrations 060–063. In particular, demo/view inventory and the statement
+> below that Gold was not touched are not current-state descriptions. See
+> [Silver operations](./SILVER_OPERATIONS.md) and
+> [Gold metric views](../gold/GOLD_METRIC_VIEWS.md) for the later reported state.
+
 **Status: SIGN-OFF NOT GRANTED YET. Three critical sign-off items remain unverified (Compute Disk allocation, real-repo commit, historical migration parity 000–003/005–009/024). Silver is NOT declared complete.**
 Decision recorded 2026-11-08: Supabase Pro is active; no historical deletion, retention or archival is applied or planned for storage reasons. All shelf history is preserved.
 Gold logic, tables, views and metrics were not touched. `gold.refresh_all()` still runs only from its own cron job (`sidnl-gold` → `silver.run_gold_pending()`).
