@@ -38,10 +38,13 @@ if not DATABASE_URL:
     sys.exit(1)
 
 try:
-    import psycopg
+    import psycopg2 as psycopg
 except ImportError:
-    print("ERROR: psycopg not installed. Run: pip install psycopg[binary]")
-    sys.exit(1)
+    try:
+        import psycopg
+    except ImportError:
+        print("ERROR: neither psycopg2 nor psycopg installed. Run: python -m pip install psycopg2-binary")
+        sys.exit(1)
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
