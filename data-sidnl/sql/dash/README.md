@@ -5,6 +5,7 @@
 |---|---|---|---|
 | `dash_001_tables` | `20261109101147` | `19ae83789206b32cd3d674652cb5bd4b` | **APPLIED** |
 | `dash_002_refresh` | `20261109101249` | `86b78e1a66d80a7f1f67721677b91387` | **APPLIED**. First full `dash.refresh(null)` ran at 10:12 UTC. |
+| `dash_006_gold_failure_retry` | `20261110094854` | `d02c02ec87870b7731601dfaa518b270` | **APPLIED** 2026-11-10. Exact SQL: `live/20261110094854_dash_006_gold_failure_retry.sql`; rollback: `006_rollback.sql`. A failed `dash.refresh`/`sync_dims` (or timeout) now marks the gold run `failed` and retries with Silver backoff; adds `dash.refresh_table_state` + `dash.v_refresh_status`. See `docs/fallbacks-design.md` Gap 1. |
 | `dash_003_schedule` | `20261109101525` | `cf8cfeea1b0a38ad98ad54e00c8e4471` | **APPLIED**. `silver.run_gold_pending()` now calls `dash.refresh(3)` after every gold refresh; errors go to `gold_stage.refresh_state` key `dash_last_error`. |
 
 The SQL that was applied is the same logic as `001_dash_tables.sql` / `002_dash_refresh.sql`, with shorter comments and a `comment on table` added per table. The exact applied text is in `supabase_migrations.schema_migrations`; export it with `../silver/ledger_verify.sql`.
