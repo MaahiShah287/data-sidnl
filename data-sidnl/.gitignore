@@ -1,20 +1,15 @@
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
 .env
 .env.*
 !.env.example
 .venv
-env/
 venv/
-ENV/
 *.log
-landing/*/*.*
-!landing/*/.gitkeep
-landing/*/_done/
-landing/*/_failed/
-logs/*.log
+
+# portal (Next.js)
+portal/node_modules/
+portal/.next/
 
 # RAG chatbot
 .pytest_cache/

@@ -1,8 +1,0 @@
-# One job = ONE line (cron does not support line continuation). Secrets come from an env file, never from the crontab:
-#   /etc/sidnl.env  (chmod 600)  ->  SUPABASE_DB_URL=postgresql://postgres.<ref>:<password>@<session-pooler-host>:5432/postgres
-# static / scheduled drops, 08:00 and 20:00 IST (server in Asia/Kolkata)
-0 8,20 * * * cd /path/to/sidnl && set -a && . /etc/sidnl.env && set +a && .venv/bin/python -m sidnl.cli daily >> logs/daily.log 2>&1
-# weekly: refresh learned brand lexicon + noise-word suggestions (Sunday 03:00)
-0 3 * * 0 cd /path/to/sidnl && set -a && . /etc/sidnl.env && set +a && .venv/bin/python -m sidnl.cli learn >> logs/learn.log 2>&1
-# housekeeping: drop processed files after 7 days
-30 3 * * * find /path/to/sidnl/landing -path '*/_done/*' -type f -mtime +7 -delete
