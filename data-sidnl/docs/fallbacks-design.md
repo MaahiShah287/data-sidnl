@@ -126,7 +126,19 @@ two config keys. No data is lost (state only).
 
 ---
 
-## Gap 2: Scraper stopped or stale (migration `dash_007_data_freshness`)
+## Gap 2: Scraper stopped or stale. **BUILT as `silver_062_bronze_freshness` (20261110110726)**
+
+> Built version, which differs from the draft below: thresholds reuse the existing `silver.freshness_policy`
+> (stock_check 48 h, brand_search 24 h, category_shelf 72 h) with per-platform overrides in `ops.freshness_override`.
+> State is kept incrementally by id cursor (`ops.freshness_cursor`, `ops.freshness_state`) by cron `sidnl-freshness`
+> every 5 min. Views: `dash.v_data_freshness` (platform × source: fresh / stale / never_seen / not_expected,
+> latest_attempt_failed) and `dash.v_platform_freshness` (banner: fresh / stale / no_data). Changes go to
+> `ops.freshness_event`; stale → alert row in `ops.cron_alert_log`. Platforms come from `silver.dim_platform` plus any
+> platform seen in bronze, so new platforms need no configuration. Tested (rolled back): Blinkit category_shelf threshold
+> lowered to 1 h → stale + event + alert; override removed → fresh + recovered; re-run → 0 events. **Not tested:** a brand-new
+> platform appearing (it would need a fake bronze row, which is not allowed).
+
+## (draft) Gap 2 as designed before approval
 
 **Mechanism.** A read-only view over bronze. It reads `max(time)` per platform from the three sources in §0.3, which are small
 (18k, 7k and 4.7k rows), so no bronze index is needed. **No bronze table is changed.**
