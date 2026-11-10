@@ -2,6 +2,18 @@
 
 _Last updated: 2026-11-10. Setup done end-to-end on Windows; DB connected, RAG index built, LLM configured. Continue from the "Next Steps" section._
 
+## 👉 FOR THE AI AGENT / COLLEAGUE CONTINUING THIS WORK — START HERE
+
+Read this whole file first, then `Rag/OPEN_QUESTIONS.md`. Then, in order:
+
+1. **Verify the environment works** (don't trust, verify): run the 4 commands in "How to run / verify setup" below. All should pass before anything else.
+2. **First real task:** end-to-end smoke test of the app — run `src/api/app.py` with uvicorn and ask "What is the in-stock rate for <a brand> on Zepto?". This exercises router → SQL path → generation. Fix whatever breaks (report the exact error in this file before fixing, so the next person sees the history).
+3. **Second task:** fill ground truth (`scripts/run_ground_truth.py`) and run `eval/run_eval.py` to get baseline scores for the RAG path.
+4. **Owner's declared next phase:** the silver→gold pipeline work (see `data-sidnl/sql/`, `docs/gold/GOLD_METRIC_VIEWS.md`). The chatbot side is unblocked; pipeline work resumes there.
+5. Do NOT re-do anything in "What was already done" below. Do NOT touch `Rag/.env` except to read it for local runs; never commit it, never print its values into chat or docs.
+
+Rules of thumb: run everything with `Rag/.venv/Scripts/python.exe` from `Rag/`; keep `.env.example` in sync when adding a new variable; update this file's "Next steps" as items complete.
+
 ## What is this project?
 
 A quick-commerce (Blinkit/Zepto/Instamart/Jiomart) analytics chatbot in `Rag/`:
