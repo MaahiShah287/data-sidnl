@@ -1,4 +1,4 @@
--- data-sidnl schema, part 1 of 3: schemas, types, sequences, tables, constraints, indexes, row-level security, comments
+-- data-sidnl schema, part 1 of 3: extensions, schemas, types, sequences, tables, constraints, indexes, row-level security, comments
 -- GENERATED from the live Supabase database by `python sidnl.py export-schema`. Do not edit by hand.
 -- Documentation and recovery baseline only: the objects already exist in production; never apply this file there.
 -- Recovery on an empty database: apply 01, 02, 03 in order, then run `select silver.run_pipeline(true, 'rebuild')`
@@ -7,6 +7,18 @@
 create schema if not exists silver;
 create schema if not exists dash;
 create schema if not exists ops;
+
+create extension if not exists pg_cron;
+
+create extension if not exists pg_net;
+
+create extension if not exists pg_trgm;
+
+create extension if not exists pgcrypto;
+
+create extension if not exists supabase_vault;
+
+create extension if not exists "uuid-ossp";
 
 create type silver.match_feat as (name_clean text, brand text, size_value numeric, size_unit text, pack_count integer, variant_key text, cat_l1 text, cat_l2 text, cat_l3 text);
 

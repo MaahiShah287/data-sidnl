@@ -2310,7 +2310,7 @@ select cron.schedule('sidnl-maintenance', '5 19 * * *', 'set statement_timeout =
 
 select cron.schedule('sidnl-pipeline', '* * * * *', 'set statement_timeout = ''600s''; select silver.run_tick()');
 
-select cron.schedule('sidnl-pipeline-daily', '35 18 * * *', 'select silver.enqueue_daily(''cron-daily'', false)');
+select cron.schedule('sidnl-pipeline-daily', '35 18 * * *', 'select silver.enqueue_daily_safe(''cron-daily'')');
 
 select cron.schedule('sidnl-reconcile', '20 19 * * *', 'set statement_timeout = ''900s''; select silver.reconcile()');
 

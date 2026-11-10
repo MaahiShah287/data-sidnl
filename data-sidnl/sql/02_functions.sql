@@ -1,4 +1,4 @@
--- data-sidnl schema, part 2 of 3: every function in silver, dash and ops (exact text of pg_get_functiondef)
+-- data-sidnl schema, part 2 of 3: every function in silver, dash and ops plus the public sidnl_* endpoint (exact text of pg_get_functiondef) and function permissions
 -- GENERATED from the live Supabase database by `python sidnl.py export-schema`. Do not edit by hand.
 -- Documentation and recovery baseline only: the objects already exist in production; never apply this file there.
 -- Recovery on an empty database: apply 01, 02, 03 in order, then run `select silver.run_pipeline(true, 'rebuild')`
@@ -416,6 +416,37 @@ AS $function$ begin
     on conflict (dedupe_key) do nothing;
     return new;
 exception when others then raise warning 'storage_alert_to_outbox: %', sqlerrm; return new; end $function$
+;
+
+CREATE OR REPLACE FUNCTION public.sidnl_heartbeat(p_token text DEFAULT NULL::text)
+ RETURNS json
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'ops', 'silver', 'public', 'pg_temp'
+AS $function$
+declare v_tok text; v_given text; v_jobs json; v_bad int; v_alert_late int := 0;
+begin
+    select decrypted_secret into v_tok from vault.decrypted_secrets where name = 'heartbeat_token' order by created_at desc limit 1;
+    v_given := coalesce(p_token, nullif(current_setting('request.headers', true), '')::json ->> 'x-heartbeat-token');
+    if v_tok is null or v_given is distinct from v_tok then
+        perform set_config('response.status', '401', true);
+        return json_build_object('ok', false, 'error', 'unauthorized');
+    end if;
+    select json_agg(json_build_object('job', jobname, 'active', active, 'last_start', last_start, 'last_status', last_status, 'overdue', od) order by jobname),
+           count(*) filter (where od)
+      into v_jobs, v_bad
+      from (select h.*, (not h.active
+                         or (h.last_start is null and h.schedule !~ '^\d+ \d+ \* \* \*$')
+                         or h.last_status = 'failed'
+                         or (h.last_start is not null and h.last_start < h.expected_by)) as od
+              from ops.v_heartbeat h) z;
+    if coalesce(silver.cfg('alert_delivery_enabled'), 0) = 1 then
+        select count(*) into v_alert_late from ops.alert_outbox where status = 'pending' and created_at < now() - interval '30 minutes';
+    end if;
+    if v_bad > 0 or v_alert_late > 0 then perform set_config('response.status', '503', true); end if;
+    return json_build_object('ok', v_bad = 0 and v_alert_late = 0, 'checked_at', now(), 'jobs_overdue', v_bad,
+                             'alerts_pending_over_30min', v_alert_late, 'jobs', v_jobs);
+end $function$
 ;
 
 CREATE OR REPLACE FUNCTION silver.approve_match(p_review_id bigint, p_by text DEFAULT SESSION_USER)
@@ -3554,6 +3585,8 @@ comment on function ops.alert_mark(p_alert_id bigint, p_ok boolean, p_err text) 
 
 comment on function ops.heartbeat() is 'Rows of ops.v_heartbeat for the heartbeat edge function (service_role only).';
 
+comment on function public.sidnl_heartbeat(p_token text) is 'Uptime-monitor endpoint (silver_067): GET /rest/v1/rpc/sidnl_heartbeat?p_token=... answers 200 when every sidnl-* cron job is active, on time and its last run did not fail, 503 otherwise, 401 without the Vault token heartbeat_token.';
+
 comment on function silver.auto_approve_exact_matches() is 'sidnl-auto-match: approves only exact cross-platform twins from match_review_queue (see silver_058). Fuzzy matches stay for review.';
 
 comment on function silver.deliver_alerts() is 'sidnl-alerts (every minute): settle earlier Slack sends, then post due outbox rows. Off while alert_delivery_enabled = 0 or the Vault secret slack_webhook_url is missing.';
@@ -3605,3 +3638,25 @@ comment on function silver.send_test_alert() is 'Owner helper: queues one info a
 comment on function silver.sidnl_everything(p_id text, p_row_limit integer) is 'All rows for one SI id across every silver/gold table and platform, as jsonb.';
 
 comment on function silver.slack_text(p_severity text, p_title text, p_body text, p_source text) is 'Slack message text for an alert: *[SIDNL severity]* title, body, source; & < > escaped for Slack.';
+
+revoke all on function ops.alert_claim(p_limit integer) from public;
+do $g$ begin if exists (select 1 from pg_roles where rolname = 'service_role') then grant execute on function ops.alert_claim(p_limit integer) to service_role; end if; end $g$;
+
+revoke all on function ops.alert_mark(p_alert_id bigint, p_ok boolean, p_err text) from public;
+do $g$ begin if exists (select 1 from pg_roles where rolname = 'service_role') then grant execute on function ops.alert_mark(p_alert_id bigint, p_ok boolean, p_err text) to service_role; end if; end $g$;
+
+revoke all on function ops.cron_alert_to_outbox() from public;
+
+revoke all on function ops.heartbeat() from public;
+do $g$ begin if exists (select 1 from pg_roles where rolname = 'service_role') then grant execute on function ops.heartbeat() to service_role; end if; end $g$;
+
+revoke all on function ops.storage_alert_to_outbox() from public;
+
+revoke all on function public.sidnl_heartbeat(p_token text) from public;
+do $g$ begin if exists (select 1 from pg_roles where rolname = 'anon') then grant execute on function public.sidnl_heartbeat(p_token text) to anon; end if; end $g$;
+do $g$ begin if exists (select 1 from pg_roles where rolname = 'authenticated') then grant execute on function public.sidnl_heartbeat(p_token text) to authenticated; end if; end $g$;
+do $g$ begin if exists (select 1 from pg_roles where rolname = 'service_role') then grant execute on function public.sidnl_heartbeat(p_token text) to service_role; end if; end $g$;
+
+revoke all on function silver.deliver_alerts() from public;
+
+revoke all on function silver.send_test_alert() from public;

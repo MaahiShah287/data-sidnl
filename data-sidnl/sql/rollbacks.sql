@@ -438,3 +438,11 @@ drop function if exists silver.slack_text(text, text, text, text);
 alter table ops.alert_outbox drop column if exists request_id;
 -- pg_net is left installed (other things may use it); to remove: drop extension pg_net;
 -- The Vault secret slack_webhook_url is not touched; to remove it: delete from vault.secrets where name = 'slack_webhook_url';
+
+-- ==================================================================== 20261110150218 silver_067_heartbeat_endpoint
+drop function if exists public.sidnl_heartbeat(text);
+-- The Vault secret heartbeat_token (created by the owner) is not touched; remove with: delete from vault.secrets where name = 'heartbeat_token';
+
+-- ==================================================================== 20261110150321 silver_068_daily_lock_safe
+select cron.alter_job(job_id := (select jobid from cron.job where jobname = 'sidnl-pipeline-daily'),
+                      command := $cmd$select silver.enqueue_daily('cron-daily', false)$cmd$);

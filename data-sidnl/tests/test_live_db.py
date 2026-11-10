@@ -101,6 +101,25 @@ class LiveDb(unittest.TestCase):
         self.conn.rollback()
         self.assertEqual(scalar(c, "select count(*) from ops.freshness_override where note = 'test'"), 0)
 
+    # ---------------------------------------------------------------- scenario 13: heartbeat endpoint
+    def test_heartbeat_requires_token_and_reports_jobs(self):
+        c = self.cur
+        c.execute("select set_config('response.status', '', true)")
+        res = scalar(c, "select public.sidnl_heartbeat(null)")
+        self.assertEqual(res["ok"], False)
+        self.assertEqual(res["error"], "unauthorized")
+        self.assertEqual(scalar(c, "select current_setting('response.status', true)"), "401")
+        self.assertEqual(scalar(c, "select count(*) from ops.heartbeat()"), scalar(c, "select count(*) from cron.job where jobname like 'sidnl-%'"))
+
+    def test_heartbeat_flags_a_paused_job_and_restores(self):
+        c = self.cur
+        before = scalar(c, "select active from cron.job where jobname = 'sidnl-store-city'")
+        c.execute("select cron.alter_job((select jobid from cron.job where jobname = 'sidnl-store-city'), active := false)")
+        c.execute("select count(*) from ops.heartbeat() where jobname = 'sidnl-store-city' and not active")
+        self.assertEqual(c.fetchone()[0], 1)
+        self.conn.rollback()
+        self.assertEqual(scalar(c, "select active from cron.job where jobname = 'sidnl-store-city'"), before)
+
 
 if __name__ == "__main__":
     unittest.main()

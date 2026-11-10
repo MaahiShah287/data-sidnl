@@ -25,7 +25,6 @@ ops     run history, quality results, alerts, checks       (ops.*)
 | `sql/manifest.csv` | every applied migration: version, name, md5 of the applied SQL |
 | `sidnl.py` | command line (below) |
 | `tests/test_live_db.py` | tests against the live database (skipped without `SUPABASE_DB_URL`) |
-| `edge-functions/heartbeat/` | uptime check for Gap 5 (not deployed, see owner steps below) |
 | `portal/` | Next.js dashboard reading `dash.*` |
 
 `sql/01..03` are **generated** from the live database (`python sidnl.py export-schema`) and checked by
@@ -81,46 +80,37 @@ select * from dash.v_brand_scorecard_latest where brand_key = 'amul';  -- a bran
 | A scraper stops | `dash.v_platform_freshness.status='stale'`, alert `freshness:<platform>/<source>` | banner data available to the app; alert row written | fix the scraper; the flag clears by itself |
 | Numbers stop matching bronze | `ops.v_reconciliation_latest` mismatch, alert `sidnl-reconcile:data` | nothing is changed automatically | investigate before trusting the dashboard |
 | A cron job keeps failing | `ops.v_cron_health.consecutive_failures >= 3`, `ops.cron_alert_log` | alert row; `recovered` row when it heals | read `cron.job_run_details.return_message` |
-| Cron itself / the database stops | nothing inside the database can tell | — | External uptime monitor polling the `heartbeat` edge function every 5 min (see owner steps) |
+| Cron itself / the database stops | an external uptime monitor polling `sidnl_heartbeat` gets 503 or no answer | nothing inside the database can notice this | see owner steps (Gap 5); then check Supabase status and `cron.job_run_details` |
 | Alerts reach nobody | `ops.alert_outbox`, `ops.v_alert_outbox_health` | rows retry with backoff (2/4/8/16 min), `dead` after 6 | check `slack_webhook_url` in Vault and `alert_delivery_enabled = 1`; see owner steps |
 
-## Owner steps to activate alerts and heartbeat (Gaps 4 and 5)
-The database side is **built and applied** (`silver_064_heartbeat`, `silver_065_alert_outbox`): `ops.v_heartbeat`,
-`ops.heartbeat()`, `silver.enqueue_daily_safe()`, the alert outbox with triggers, `ops.alert_claim()` / `ops.alert_mark()`.
-Delivery is **off** (`alert_delivery_enabled = 0`); alerts are collected in `ops.alert_outbox` once delivery is on.
-What is left needs your accounts and decisions (nothing below has been done, and the heartbeat edge function has **not been
-deployed or tested** - only the database side was tested; Gap 4 needs no edge function):
+## Owner steps for Gaps 4 and 5 (both built and applied; both need your secrets, so they are off until you do this)
+Run these in the Supabase SQL editor. Never paste a secret into chat or a file.
 
-0. **The heartbeat function** calls `ops.heartbeat()` through Supabase's REST API, which exposes only `public` by default: add
-   `ops` under Dashboard > Project Settings > API > Exposed schemas first (`ops` tables stay unreadable: RLS is on and only
-   `service_role` can call the definer function).
+### Gap 4 - alert delivery to Slack (switched off)
+Alerts are sent from the database (pg_net) by the `sidnl-alerts` cron job; the webhook lives only in Vault.
+1. `select vault.create_secret('https://hooks.slack.com/services/...', 'slack_webhook_url');`
+2. `update silver.sidnl_config set value_num = 1 where key = 'alert_delivery_enabled';`
+3. `select silver.send_test_alert();`  -> a "Test alert" should appear in Slack within a minute.
+Check: `select * from ops.v_alert_outbox_health;`. Stop: set `alert_delivery_enabled` back to 0.
+Retries: 2/4/8/16 min, `dead` after 6 attempts; a send with no answer is marked failed, never resent.
 
-### Gap 5 - heartbeat (uptime monitoring)
-1. `supabase functions deploy heartbeat --no-verify-jwt`
-2. Point an external uptime monitor (UptimeRobot, BetterStack, ...) at
-   `https://jqxnaqbvwgmfkyzfincy.supabase.co/functions/v1/heartbeat` every **5 minutes**: 200 = all jobs on time,
-   503 = a job is overdue, paused, last run failed, or the database is unreachable.
-3. Optional, recommended (changes a cron command, so it needs your OK): make the daily job lock-safe. It timed out on
-   2026-11-09 because `run_tick` had already queued the same daily job.
-   ```sql
-   select cron.unschedule('sidnl-pipeline-daily');
-   select cron.schedule('sidnl-pipeline-daily', '35 18 * * *', $cmd$select silver.enqueue_daily_safe('cron-daily')$cmd$);
-   ```
-   then `python sidnl.py export-schema`, `python sidnl.py verify`, commit.
+### Gap 5 - heartbeat for an external uptime monitor (the endpoint is live, locked until you create the token)
+`public.sidnl_heartbeat` answers **200** when every `sidnl-*` cron job is active, started on time and its last run did not
+fail (and no alert has waited over 30 min while delivery is on), **503** otherwise, **401** without the token. It is the only
+object the project keeps in schema `public` (the REST API serves `public`). Its answer lists only job names, times and flags.
+1. Create the token (it stays secret, only you can read it):
+   `select vault.create_secret(encode(gen_random_bytes(24), 'hex'), 'heartbeat_token');`
+   `select decrypted_secret from vault.decrypted_secrets where name = 'heartbeat_token';`  -> copy it.
+2. In an uptime monitor (UptimeRobot, BetterStack, Healthchecks.io...) add an HTTP monitor, every **5 minutes**, alert when
+   the status is not 200 for 2 checks in a row:
+   `https://jqxnaqbvwgmfkyzfincy.supabase.co/rest/v1/rpc/sidnl_heartbeat?apikey=<publishable key>&p_token=<token>`
+   (publishable key: Dashboard > Project Settings > API Keys; it is public by design. The token can also be sent as header
+   `x-heartbeat-token`.)
+3. Tested over HTTP without a token: 401 from the function, and a request without a key is rejected by the gateway.
+   Not tested: the 200 and 503 answers over HTTP (they need your token); the logic for both was tested in the database.
+Today it would answer 503 until the 18:35 UTC daily run succeeds, because the daily job failed on 2026-11-09.
+The daily job now uses `silver.enqueue_daily_safe`, which cannot time out on the day's job row any more (`silver_068`).
 
-### Gap 4 - alert delivery (Slack): built and applied (`silver_066_alert_delivery`), switched OFF
-Alerts are sent **from the database** (pg_net, installed) by the `sidnl-alerts` cron job. No edge function, no exposed
-schema, no service-role key. Two things are left, and only you can do them (the webhook is a secret: never paste it in
-chat or a file):
-1. In the Supabase SQL editor, store your Slack incoming-webhook URL in Vault:
-   `select vault.create_secret('https://hooks.slack.com/services/...', 'slack_webhook_url');`
-2. Switch delivery on and send a test:
-   ```sql
-   update silver.sidnl_config set value_num = 1 where key = 'alert_delivery_enabled';
-   select silver.send_test_alert();     -- a "Test alert" should appear in Slack within a minute
-   ```
-Check: `select * from ops.v_alert_outbox_health;` and `select status, attempts, last_error from ops.alert_outbox order by alert_id desc limit 10;`
-To stop: `update silver.sidnl_config set value_num = 0 where key = 'alert_delivery_enabled';`
 
 ## Changing the database (the only way)
 1. Write a migration `silver_NNN_slug` / `dash_NNN_slug`.
@@ -130,4 +120,4 @@ To stop: `update silver.sidnl_config set value_num = 0 where key = 'alert_delive
 5. `python sidnl.py export-schema`, then `python sidnl.py verify`, then commit and push to `main`.
 
 Rules: bronze is never written; no invented or sample data; SI-id logic (`silver.resequence_sidnl`) is never changed;
-secrets only in Supabase Vault / edge-function secrets.
+secrets only in Supabase Vault.

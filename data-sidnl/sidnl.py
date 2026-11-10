@@ -133,10 +133,19 @@ with nsp as (
     select ad.adrelid, ad.adnum
       from pg_attrdef ad join rel r on r.oid = ad.adrelid
      where pg_get_expr(ad.adbin, ad.adrelid) ~ '(silver|dash|ops)\.[a-z_]+\('
+), fn as (   -- our functions: schemas silver / dash / ops, plus the public endpoint function(s) named sidnl_*
+    select p.oid, p.proname, p.proacl, n.nspname,
+           n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as sig
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where p.prokind = 'f'
+       and (n.nspname in ('silver', 'dash', 'ops') or (n.nspname = 'public' and p.proname like 'sidnl\_%'))
 ), parts as (
-    -- ===================== part 1: schemas, types, sequences, tables, constraints, indexes, RLS, comments ==========
+    -- ===================== part 1: extensions, schemas, types, sequences, tables, constraints, indexes, RLS, comments
     select 'tables' as part, 1 as sec, '' as k,
            E'create schema if not exists silver;\ncreate schema if not exists dash;\ncreate schema if not exists ops;' as txt
+    union all
+    select 'tables', 1, 'ext ' || e.extname, format('create extension if not exists %I;', e.extname)
+      from pg_extension e where e.extname in ('pg_trgm', 'pg_cron', 'pg_net', 'pgcrypto', 'uuid-ossp', 'supabase_vault')
     union all
     select 'tables', 2, format('%I.%I', n.nspname, t.typname),
            format('create type %I.%I as (%s);', n.nspname, t.typname,
@@ -204,14 +213,10 @@ with nsp as (
     union all
     select 'functions', 1, '', 'set check_function_bodies = off;'
     union all
-    select 'functions', 2, n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
-           pg_get_functiondef(p.oid) || ';'
-      from pg_proc p join nsp n on n.oid = p.pronamespace where p.prokind = 'f'
+    select 'functions', 2, f.sig, pg_get_functiondef(f.oid) || ';' from fn f
     union all
-    select 'functions', 3, n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
-           format('comment on function %I.%I(%s) is %L;', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), d.description)
-      from pg_proc p join nsp n on n.oid = p.pronamespace
-      join pg_description d on d.objoid = p.oid and d.classoid = 'pg_proc'::regclass
+    select 'functions', 3, f.sig, format('comment on function %s is %L;', f.sig, d.description)
+      from fn f join pg_description d on d.objoid = f.oid and d.classoid = 'pg_proc'::regclass
     union all
     select 'functions', 4, r.fq || ' ' || a.attname,
            format('alter table %s alter column %I set default %s;', r.fq, a.attname, pg_get_expr(ad.adbin, ad.adrelid))
@@ -219,6 +224,16 @@ with nsp as (
       join pg_attrdef ad on ad.adrelid = dd.adrelid and ad.adnum = dd.adnum
       join rel r on r.oid = dd.adrelid
       join pg_attribute a on a.attrelid = dd.adrelid and a.attnum = dd.adnum
+    union all
+    -- function permissions: revoke the PUBLIC default where it was removed, then grant to the roles that have access
+    select 'functions', 5, f.sig,
+           case when not exists (select 1 from aclexplode(f.proacl) x where x.grantee = 0)
+                then format('revoke all on function %s from public;', f.sig) else '' end
+           || coalesce((select string_agg(format(E'\ndo $g$ begin if exists (select 1 from pg_roles where rolname = %L) then grant execute on function %s to %I; end if; end $g$;',
+                                                 x.grantee::regrole::text, f.sig, x.grantee::regrole::text), '' order by x.grantee::regrole::text)
+                          from aclexplode(f.proacl) x
+                         where x.grantee <> 0 and x.grantee::regrole::text <> 'postgres'), '')
+      from fn f where f.proacl is not null
     -- ===================== part 3: views (dependency order), grants, configuration rows, cron jobs =================
     union all
     select 'views', 1, lpad(r.oid::text, 12, '0'),
@@ -262,14 +277,14 @@ with nsp as (
       from cron.job j where j.jobname like 'sidnl-%'
 )
 select part, string_agg(txt, E'\n\n' order by sec, k) as body
-  from parts group by part
+  from parts where txt <> '' group by part
 """
 
 MANIFEST_SQL = """select version, name, md5(array_to_string(statements, E'\\n')) as md5
                     from supabase_migrations.schema_migrations order by version"""
 
-WHAT = {"tables": "schemas, types, sequences, tables, constraints, indexes, row-level security, comments",
-        "functions": "every function in silver, dash and ops (exact text of pg_get_functiondef)",
+WHAT = {"tables": "extensions, schemas, types, sequences, tables, constraints, indexes, row-level security, comments",
+        "functions": "every function in silver, dash and ops plus the public sidnl_* endpoint (exact text of pg_get_functiondef) and function permissions",
         "views": "views in dependency order, grants, configuration rows (no data rows), pg_cron jobs"}
 
 
