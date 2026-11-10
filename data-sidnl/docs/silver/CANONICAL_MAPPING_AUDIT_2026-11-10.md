@@ -82,9 +82,17 @@ KitKat (1,259), Bournville (167), Maggi (63), no brand (50) and demo (166) are n
 
 **D5.** `match_review_queue` review_id 2 (product 1108) is still `pending` although its xref is already NEW_MASTER.
 
-## 5. Proposed fixes (none applied; each needs approval, a migration and a rollback)
-1. `parse_pack`: accept a trailing `x N` / `X N` multiplier and `N x 1 pc`; add these exact bronze strings to `selftest_parser`;
-   reload the 13 products through the normal pipeline. pack_count is a resequence tie-break, so the existing pipeline may renumber some SI ids.
+## 5. Fixes
+1. **D1, DONE: `silver_056_parse_pack_counts`** (version `20261110101147`, exact SQL in
+   `sql/silver/live/20261110101147_silver_056_parse_pack_counts.sql`, rollback `sql/silver/056_rollback.sql`).
+   While fixing it, the full sweep over every bronze pack pattern found the defect is **2,106 products, not 13**:
+   `N tabs` 1,670 and `N capsules` 185 had lost their count (1 pc); `N pcs` 219 and `N units` 5 had total = N²;
+   `2 x 10 pcs` 8 → total 100; `N ml/g X N` 10, `2 x 1 pc` 3, `40U x 25g`, `4 packs`, `30 sheets`, `1 unit + 1 unit`;
+   `7 pcs + 102 g` 2 had been multiplied to 714 g. New convention: size = content of one pack (g/ml/pc), pack_count = number
+   of packs, total = size × count. The pre-apply dry run (rolled back) showed: only those patterns change; 13 are g/ml rows; the
+   full parser self-test (now with all these bronze strings) passes; quality checks pass; 0 SI ids renumbered; the rollback restores
+   both function md5s and every row. The parser and its self-test are replaced in one migration because `quality_checks()` runs the self-test.
+   Remaining effect on dash: `pricing.price_per_100g` changes for the 13 g/ml products at the next gold refresh.
 2. `first_seen_at = least(current, min observed_at)` in the loader; one-time correction of the 63 rows from their own facts.
 3. A **deterministic** cross-platform rule: auto-merge only when brand_key, normalized name and parsed size/unit/pack are all identical
    (4 today). Keep fuzzy auto-merge **off**. Anything else stays a separate SI id per platform. That never produces a wrong number;
