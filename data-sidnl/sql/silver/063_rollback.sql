@@ -1,27 +1,17 @@
--- =============================================================================
--- File:    063_rollback.sql
--- Reverts: 20261110121500_silver_063_dead_letter.sql
--- Dead-letter rows are never deleted by the system; if any exist they are
--- preserved to ops.dead_letter_backup before dropping.
--- =============================================================================
-
-do $$
-begin
-  if to_regclass('ops.dead_letter') is not null
-     and exists (select 1 from ops.dead_letter) then
-    create table if not exists ops.dead_letter_backup as
-      select * from ops.dead_letter;
-  end if;
-end $$;
-
-drop view if exists ops.v_scope_health;
-drop view if exists ops.v_dead_letter_open;
-drop function if exists silver.retry_dead_letters(p_force bool);
-drop function if exists silver.isolate_bad_rows(text, text, bigint, bigint, text, int);
+-- Rollback for silver_063_dead_letter.
+-- After rollback, rows that are 'open' in ops.dead_letter are no longer excluded: the next load retries them and, if
+-- they still fail, the whole scope fails again (pre-063 behaviour). Export ops.dead_letter first if you need the history.
+select cron.unschedule('sidnl-dead-letter');
+select cron.unschedule('sidnl-reconcile-coverage');
+do $rb$ declare r record; begin
+  for r in select definition from ops.function_backup where tag = 'pre_silver_063' loop execute r.definition; end loop;
+end $rb$;
+drop function if exists silver.reconcile_coverage();
+drop function if exists silver.ignore_dead_letter(bigint, text, text);
+drop function if exists silver.retry_dead_letters(boolean);
+drop function if exists silver.load_category_range(text, text, text, bigint, bigint, bigint);
+drop function if exists silver.load_category_chunk(text, text, text, bigint, bigint, bigint);
+drop view if exists ops.v_dead_letter_summary;
 drop table if exists ops.dead_letter;
-
-delete from silver.sidnl_config
- where key in ('dead_letter_retry_minutes','dead_letter_max_retries');
-
--- NOTE: if the Phase 3 loader predicates were added to the live loaders,
--- revert those create-or-replace functions from ops.function_backup too.
+delete from silver.sidnl_config where key in ('dead_letter_max_per_chunk', 'dead_letter_retry_minutes', 'dead_letter_max_retries');
+delete from ops.function_backup where tag = 'pre_silver_063';

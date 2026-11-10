@@ -1,21 +1,17 @@
 # Fallback mechanisms for Silver and Gold: audit and design
 
-Status: **PHASE 2 PARTIALLY IMPLEMENTED (2026-11-10). Phase 3 tests pending.**
-- Gap 1: applied earlier (`dash_006_gold_failure_retry`).
-- Gap 2: **implemented by silver_062_bronze_freshness** (incremental cursor design; freshness alerts land in
-  `ops.cron_alert_log`, `sidnl-freshness` cron every 5 min). Threshold policy lives in `silver.freshness_policy`
-  + `ops.freshness_override` (Q4 applied: set `expected=false` there for instamart/jiomart rows).
-- Gaps 3/4/5 SQL written as **silver_063 (dead-letter, Option A)**, **silver_065 (alert outbox — bridges ALL
-  alert log tables, including silver_062's freshness alerts, to Slack)**, **silver_064 (heartbeat + lock-safe
-  daily cron)**, plus edge functions in `edge-functions/`. **063/064/065 NOT applied to the DB yet** — apply
-  in order 063 → 064 → 065 with admin (Supabase SQL editor); `[ADMIN]` items marked inside the files
-  (Gap 3 loader predicates, run_tick + record_storage_snapshot hooks, cron swap, pg_net, deploy + secrets).
-Decisions taken (2026-11-10, owner): Q1 keep repo layout; Q2 accept "not tested" for
-cron-timing parts; Q3 **Option A**; Q4 expected = blinkit+zepto on all three sources
-(instamart/jiomart not scraped); Q5 pg_net + Slack, at-most-once; Q6 yes to lock-safe daily cron.
-Remaining Phase 3 items marked `[ADMIN]` inside the migration files: loader predicates for
-Gap 3 (needs live loader text), freshness hook in `record_storage_snapshot`, run_tick hook for
-`retry_dead_letters`, cron command swap, pg_net enable, edge-function deploy + secrets.
+Status (2026-11-10, checked against `supabase_migrations.schema_migrations`):
+- **Gap 1 LIVE**: `dash_006_gold_failure_retry` (20261110094854) + `dash_007_visibility_full_rebuild` (20261110102500).
+- **Gap 2 LIVE**: `silver_062_bronze_freshness` (20261110110726), cron `sidnl-freshness` every 5 min.
+- **Gap 3 LIVE**: `silver_063_dead_letter` (20261110112254), crons `sidnl-dead-letter`, `sidnl-reconcile-coverage`.
+  Loader predicate and bisection are inside the live loader; nothing left for an admin to apply.
+- **Gaps 4/5 NOT built.** Drafts from commit b314c08 are in `sql/silver/drafts/unapplied_b314c08/` (moved out of
+  `live/` because they were never applied). Its 063 is superseded by the live 063; its 065 outbox trigger reads
+  columns `ops.cron_alert_log` does not have and must be fixed before use (see that folder's README). Edge functions
+  `edge-functions/alert-dispatch` and `edge-functions/heartbeat` exist in the repo but are not deployed.
+Decisions as recorded in commit b314c08 (to be confirmed by the owner): Q1 keep repo layout; Q2 accept "not tested"
+for cron-timing parts; Q3 Option A (done); Q4 expected = blinkit+zepto on all three sources (instamart/jiomart not
+scraped, set `expected=false` in `ops.freshness_override`); Q5 pg_net + Slack, at-most-once; Q6 lock-safe daily cron.
 Audit date: 2026-11-10, against the live project `jqxnaqbvwgmfkyzfincy`. Everything below was read from the live
 catalog (`pg_get_functiondef`, `cron.job`, `information_schema`), not from the repo copies.
 
@@ -183,7 +179,21 @@ supposed to be scraped, set `is_expected=false` for them (Q4).
 
 ---
 
-## Gap 3: Dead-letter table for bad rows (migration `silver_056_dead_letter`). **Needs a decision (Q3).**
+## Gap 3: Dead-letter table for bad rows. **BUILT as `silver_063_dead_letter` (20261110112254), option A for category shelves**
+
+> Built: the category loader's chunk body is unchanged but moved into `silver.load_category_chunk()` (plus one exclusion
+> of `open` dead letters); `silver.load_category_range()` splits a chunk that fails with a permanent error down to the
+> single failing bronze rows and writes only those to `ops.dead_letter`. Transient errors and more than
+> `dead_letter_max_per_chunk` (100) failing rows in one chunk re-raise, so the scope fails as before. Cron
+> `sidnl-dead-letter` (15 min) retries with backoff; `silver.ignore_dead_letter()` closes a row with a reason;
+> `silver.reconcile_coverage()` (cron `sidnl-reconcile-coverage`, daily) proves every bronze shelf row up to each scope's
+> watermark is in silver or in `ops.dead_letter`. Tested (rolled back) on real scope blinkit/9/943 (11,579 rows):
+> full reload unchanged; 3 injected bad rows dead-lettered and 11,576 loaded; rerun skips them; retry with fault still
+> present → still failing; fault removed → resolved, 11,579 rows, 0 value differences; all rows failing → cap error, scope
+> fails, nothing parked; transient error → re-raised, nothing parked. Live coverage: 1,832,098 rows, 0 unaccounted.
+> **Not covered:** `refresh_brand` (client-brand readings, ~3% of rows) keeps per-brand isolation only.
+
+## (draft) Gap 3 as designed before approval
 
 **What "bad row" means here.** Rows that fail a DQ rule are already kept in silver with `dq_status <> 'valid'` (none today),
 so they are never silently dropped. The real failure mode is #7 in §0.4: **one row that breaks a constraint raises for
