@@ -5,6 +5,13 @@
 //   supabase secrets set SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 // Cron sidnl-alerts (or the external monitor) POSTs here every minute.
 
+declare const Deno: {
+  env: {
+    get: (key: string) => string | undefined;
+  };
+  serve: (handler: () => Promise<Response> | Response) => void;
+};
+
 Deno.serve(async () => {
   const webhook = Deno.env.get("SLACK_WEBHOOK_URL");
   if (!webhook) {
@@ -12,7 +19,8 @@ Deno.serve(async () => {
       status: 500, headers: { "content-type": "application/json" } });
   }
 
-  const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2");
+  // @ts-ignore: URL import resolved natively by Deno runtime at deployment
+  const { createClient } = (await import("https://esm.sh/@supabase/supabase-js@2")) as any;
   const admin = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,

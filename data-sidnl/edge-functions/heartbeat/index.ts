@@ -21,14 +21,16 @@ Deno.serve(async () => {
       throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured");
     }
 
-    const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2");
+    // @ts-ignore: URL import resolved natively by Deno runtime at deployment
+    const { createClient } = (await import("https://esm.sh/@supabase/supabase-js@2")) as any;
     const admin = createClient(supabaseUrl, serviceRoleKey, { db: { schema: "ops" } });
-    // .from() now resolves to ops.v_heartbeat (schema set above)
+
+    // .from() resolves to ops.v_heartbeat (schema set above)
     const { data, error } = await admin.from("v_heartbeat").select("*");
     if (error) throw new Error(error.message);
 
     // v_heartbeat rows: jobname, active, last_start, last_status, expected_by
-    const isOverdue = (r: (typeof data)[number]) =>
+    const isOverdue = (r: any) =>
       r.active === false ||
       !r.last_start ||
       r.last_status === "failed" ||
@@ -38,7 +40,7 @@ Deno.serve(async () => {
     const body = {
       ok: overdue.length === 0,
       // expose only job names, timestamps and ok/overdue flag — no data values
-      jobs: (data ?? []).map((r: (typeof data)[number]) => ({
+      jobs: (data ?? []).map((r: any) => ({
         job: r.jobname,
         active: r.active,
         last_start: r.last_start,
