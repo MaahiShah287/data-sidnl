@@ -18,3 +18,7 @@ reports/
 rag/.env
 rag/.env.*
 !rag/.env.example
+
+# Local LLM outputs
+Claude outputs/
+

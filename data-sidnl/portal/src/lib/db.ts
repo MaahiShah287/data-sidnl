@@ -26,11 +26,39 @@ export const pct = (v: any, d = 1) => (v == null ? '—' : `${Number(v).toFixed(
 export const osaColor = (v: number | null) =>
   v == null ? 'text-slate-400' : v >= 80 ? 'text-emerald-600' : v >= 60 ? 'text-amber-600' : 'text-red-600';
 
-/** Latest refresh time + error state, shown in every page header. */
+/** Latest gold refresh state, shown in every page header.
+ *
+ *  Reads dash.v_refresh_status (one row per dash table) and returns the
+ *  worst-case summary: the most recent successful refresh, whether any table
+ *  is stale, and whether any refresh is currently failing. NULL is returned as
+ *  "not measured" (never displayed as 0 or false). */
 export async function freshness() {
-  const r = await q<{ refreshed_at: string; err: string | null }>(
-    `select (select max(refreshed_at) from dash.availability) refreshed_at,
-            (select value from dash.refresh_state where key = 'last_error') err`
+  const rows = await q<{
+    last_refreshed_at: string | null;
+    is_stale: boolean | null;
+    refresh_failing: boolean | null;
+    last_error: string | null;
+  }>(
+    `select
+       max(last_refreshed_at)                              as last_refreshed_at,
+       bool_or(is_stale)                                   as is_stale,
+       bool_or(refresh_failing)                            as refresh_failing,
+       (array_agg(last_error order by last_attempt_at desc) filter (where last_error is not null))[1]
+                                                           as last_error
+     from dash.v_refresh_status`
   );
-  return r[0];
+  return rows[0] ?? null;
+}
+
+/** Per-platform data freshness banner (from bronze).
+ *
+ *  Returns rows from dash.v_platform_freshness where status = 'stale'.
+ *  Empty array = all platforms fresh (no banner shown). */
+export async function stalePlatforms() {
+  return q<{ platform: string; hours_since_last_data: number; stale_sources: string[] }>(
+    `select platform, hours_since_last_data::float8, stale_sources
+       from dash.v_platform_freshness
+      where status = 'stale'
+      order by hours_since_last_data desc`
+  );
 }

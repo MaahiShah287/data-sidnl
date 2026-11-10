@@ -1,23 +1,28 @@
--- data-sidnl: every rollback, one section per migration, newest last. Text copied unchanged from the old
--- per-migration rollback files. Run ONE section by hand (as a Supabase migration) only to undo that migration.
--- Migrations older than silver_041 have no rollback (they built the base schema); restore those from
--- sql/01..03 instead. New migrations: append a section here in the same format.
+-- data-sidnl: every rollback, one section per migration, newest last. Run ONE section (as a Supabase migration, after
+-- a rolled-back dry run) only to undo that migration.
+-- ORDER MATTERS: a section is only valid once every NEWER migration has been rolled back first (undo newest-first).
+-- Migrations older than silver_041 have no rollback (they built the base schema); restore those from sql/01..03.
+-- Sections 041-050 were written before silver_047 moved the run logs to schema ops and silver_054 dropped silver.demo;
+-- their object names were updated on 2026-11-10 to the objects that exist today (marked "updated 2026-11-10").
+-- New migrations: append a section here in the same format.
 
 -- ==================================================================== 20261107195949 silver_041_brand_loader_noop_guard
+-- (object names updated 2026-11-10: run logs live in schema ops since silver_047)
 -- Restores silver.refresh_brand to its pre-041 definition (latest backup tagged pre_041).
 do $r$ declare d text; begin
-  select definition into d from silver.function_backup where fn='silver.refresh_brand(text,boolean)' and tag='pre_041' order by saved_at desc limit 1;
+  select definition into d from ops.function_backup where fn='silver.refresh_brand(text,boolean)' and tag='pre_041' order by saved_at desc limit 1;
   if d is null then raise exception 'no pre_041 backup'; end if;
   execute d;
 end $r$;
 
 -- ==================================================================== 20261107200119 silver_042_storage_alerts
+-- (object names updated 2026-11-10: run logs live in schema ops since silver_047)
 -- restore 039 version of record_storage_snapshot (no alert call), then drop 042 objects (all additive, no data loss)
-create or replace function silver.record_storage_snapshot() returns integer language plpgsql set search_path to 'silver','public','pg_temp' as $f$
+create or replace function silver.record_storage_snapshot() returns integer language plpgsql set search_path to 'silver','ops','public','pg_temp' as $f$
 declare v_d date := (now() at time zone 'Asia/Kolkata')::date; v_n int;
 begin
-    if exists (select 1 from silver.storage_snapshot where snapshot_date = v_d) then return 0; end if;
-    insert into silver.storage_snapshot (snapshot_date, relation, total_bytes, table_bytes, index_bytes, live_rows, dead_rows, db_bytes)
+    if exists (select 1 from ops.storage_snapshot where snapshot_date = v_d) then return 0; end if;
+    insert into ops.storage_snapshot (snapshot_date, relation, total_bytes, table_bytes, index_bytes, live_rows, dead_rows, db_bytes)
     select v_d, n.nspname || '.' || c.relname, pg_total_relation_size(c.oid), pg_relation_size(c.oid), pg_indexes_size(c.oid),
            s.n_live_tup, s.n_dead_tup, pg_database_size(current_database())
       from pg_class c join pg_namespace n on n.oid = c.relnamespace
@@ -26,24 +31,26 @@ begin
     on conflict do nothing;
     get diagnostics v_n = row_count; return v_n;
 end $f$;
-drop view if exists silver.v_storage_projection;
+drop view if exists ops.v_storage_projection;
 drop function if exists silver.check_storage_alert();
 drop function if exists silver.storage_usage();
-drop table if exists silver.storage_alert_log;
+drop table if exists ops.storage_alert_log;
 delete from silver.sidnl_config where key in ('storage_plan_gb','storage_warn_pct','storage_crit_pct');
 
 -- ==================================================================== 20261107201340 silver_043_cron_health_view
-drop view if exists silver.v_cron_health;
+-- (object names updated 2026-11-10: run logs live in schema ops since silver_047)
+drop view if exists ops.v_cron_health;
 
 -- ==================================================================== 20261107202823 silver_044_cron_failure_alert
+-- (object names updated 2026-11-10: run logs live in schema ops since silver_047)
 -- restore 042 record_storage_snapshot, 043 view definition; drop additive 044 objects
 create or replace function silver.record_storage_snapshot() returns integer
-language plpgsql set search_path to 'silver','public','pg_temp' as $f$
+language plpgsql set search_path to 'silver','ops','public','pg_temp' as $f$
 declare v_d date := (now() at time zone 'Asia/Kolkata')::date; v_n int := 0;
 begin
   begin perform silver.check_storage_alert(); exception when others then raise warning 'check_storage_alert failed: %', sqlerrm; end;
-  if exists (select 1 from silver.storage_snapshot where snapshot_date = v_d) then return 0; end if;
-  insert into silver.storage_snapshot (snapshot_date, relation, total_bytes, table_bytes, index_bytes, live_rows, dead_rows, db_bytes)
+  if exists (select 1 from ops.storage_snapshot where snapshot_date = v_d) then return 0; end if;
+  insert into ops.storage_snapshot (snapshot_date, relation, total_bytes, table_bytes, index_bytes, live_rows, dead_rows, db_bytes)
   select v_d, n.nspname || '.' || c.relname, pg_total_relation_size(c.oid), pg_relation_size(c.oid), pg_indexes_size(c.oid),
          s.n_live_tup, s.n_dead_tup, pg_database_size(current_database())
     from pg_class c join pg_namespace n on n.oid = c.relnamespace
@@ -53,9 +60,9 @@ begin
   get diagnostics v_n = row_count; return v_n;
 end $f$;
 drop function if exists silver.check_cron_alert();
-drop table if exists silver.cron_alert_log;
+drop table if exists ops.cron_alert_log;
 delete from silver.sidnl_config where key = 'cron_alert_consecutive_failures';
-create or replace view silver.v_cron_health with (security_invoker = true) as
+create or replace view ops.v_cron_health with (security_invoker = true) as
 select j.jobname, j.schedule, j.active,
        count(d.runid) filter (where d.start_time > now() - interval '24 hours') as runs_24h,
        count(d.runid) filter (where d.start_time > now() - interval '24 hours' and d.status = 'failed') as failures_24h,
@@ -68,23 +75,32 @@ from cron.job j left join cron.job_run_details d on d.jobid = j.jobid and d.star
 where j.jobname like 'sidnl-%' group by j.jobid, j.jobname, j.schedule, j.active;
 
 -- ==================================================================== 20261109065005 silver_050_views_security_invoker
+-- (updated 2026-11-10: 'if exists' because silver_054 dropped silver.demo)
 -- rollback 050: return the 10 views to owner-rights execution (the pre-050 state)
-alter view silver.demo               reset (security_invoker);
-alter view silver.jiomart            reset (security_invoker);
-alter view silver.instamart          reset (security_invoker);
-alter view silver.zepto              reset (security_invoker);
-alter view silver.blinkit            reset (security_invoker);
-alter view silver.v_wide             reset (security_invoker);
-alter view silver.v_sku_listing      reset (security_invoker);
-alter view silver.v_data_freshness   reset (security_invoker);
-alter view silver.v_reading_current  reset (security_invoker);
-alter view silver.v_reading          reset (security_invoker);
+alter view if exists silver.demo               reset (security_invoker);
+alter view if exists silver.jiomart            reset (security_invoker);
+alter view if exists silver.instamart          reset (security_invoker);
+alter view if exists silver.zepto              reset (security_invoker);
+alter view if exists silver.blinkit            reset (security_invoker);
+alter view if exists silver.v_wide             reset (security_invoker);
+alter view if exists silver.v_sku_listing      reset (security_invoker);
+alter view if exists silver.v_data_freshness   reset (security_invoker);
+alter view if exists silver.v_reading_current  reset (security_invoker);
+alter view if exists silver.v_reading          reset (security_invoker);
 
 -- ==================================================================== 20261109101147 dash_001_tables + dash_002_refresh
 -- rollback 001 + 002: remove the dash schema (6 tables + refresh function) and the one config row 001 added.
 -- Roll back 003 first if it was applied: run_gold_pending calls dash.refresh().
+-- (updated 2026-11-10) guard: dash now also holds objects from dash_005..dash_009 and silver_062; refuse to drop the
+-- schema while any of them exists, so this can never wipe them by running out of order.
+do $guard$ begin
+  if to_regclass('dash.dim_sidnl') is not null or to_regclass('dash.refresh_table_state') is not null
+     or to_regclass('dash.v_brand_scorecard') is not null or to_regclass('dash.v_data_freshness') is not null then
+    raise exception 'roll back dash_005..dash_009 and silver_062 first; dash still holds their objects';
+  end if;
+end $guard$;
 drop schema if exists dash cascade;
-delete from gold.cfg_threshold where key = 'low_stock_fe_units';
+delete from gold.cfg_threshold where key = 'low_stock_fe_units';   -- gold existed when 001 was applied (pre dash_004)
 
 -- ==================================================================== 20261109101525 dash_003_schedule
 -- rollback 003: restore silver.run_gold_pending exactly as live on 2026-11-09 (without the dash block)
@@ -136,18 +152,19 @@ end $function$;
 --
 -- 004 drops derived data only. Everything comes from silver, so a rollback rebuilds it rather than restoring it from a backup.
 --
--- 1. **Restore the functions** saved by 004 (tag `pre_dash_004`), oldest dependency first:
+-- 1. **Restore the functions** (updated 2026-11-10: 004 never saved them; there is no `pre_dash_004` tag in
+--    ops.function_backup). Their exact text is in the applied gold migrations, in version order:
 --    ```sql
---    select definition from ops.function_backup where tag = 'pre_dash_004' and fn like 'gold.%' order by fn;
---    select definition from ops.function_backup where tag = 'pre_dash_004' and fn like 'silver.run_gold_pending%';
+--    select version, name, statements from supabase_migrations.schema_migrations
+--     where name like 'gold_%' or name like 'dash_00%' order by version;
 --    ```
---    Run each `definition`. `gold_stage.*` functions need their schema and tables first (step 2).
+--    Re-run the gold_* statements up to dash_004 (schema and tables before functions), and run_gold_pending as of dash_003.
 -- 2. **Recreate the tables:**
 --    - The gold summary tables: the exact applied SQL of the `gold_*` migrations, kept by Supabase:
 --      `select name, statements from supabase_migrations.schema_migrations where name like 'gold_%' order by version;`
 --      (the old repo copies under sql/gold/ were removed in the 2026-11-10 consolidation; git history still has them).
 --    - The `metric_*` tables and the `gold_stage` schema: migration `gold_102_lean_metric_tables` (same query).
---    - Then run each saved `view gold.*` definition from `ops.function_backup`.
+--    - The gold views are created by the same gold_* migrations.
 -- 3. **Re-fill:** `select gold.refresh_all(); select gold_stage.refresh_metrics();`
 --
 -- `dash.*`, the `dim_*` tables, `cfg_*` and `v_valid_reading` are untouched by 004 and need no rollback.
@@ -346,3 +363,30 @@ drop view if exists ops.v_dead_letter_summary;
 drop table if exists ops.dead_letter;
 delete from silver.sidnl_config where key in ('dead_letter_max_per_chunk', 'dead_letter_retry_minutes', 'dead_letter_max_retries');
 delete from ops.function_backup where tag = 'pre_silver_063';
+
+-- == silver_064_heartbeat ==
+drop view if exists ops.v_heartbeat;
+drop function if exists silver.enqueue_daily_safe(p_reason text);
+delete from silver.sidnl_config
+ where key in ('heartbeat_pipeline_max_minutes', 'heartbeat_gold_max_minutes',
+               'heartbeat_daily_max_hours', 'heartbeat_run_max_minutes');
+-- if the sidnl-pipeline-daily command was updated (admin step 4), restore it:
+--   select cron.unschedule('sidnl-pipeline-daily');
+--   select cron.schedule('sidnl-pipeline-daily', '35 18 * * *',
+--     'set statement_timeout=''600s''; select silver.enqueue_daily(''cron-daily'', false);');
+
+-- == silver_065_alert_outbox ==
+drop trigger if exists trg_cron_alert_outbox on ops.cron_alert_log;
+drop trigger if exists trg_storage_alert_outbox on ops.storage_alert_log;
+drop function if exists ops.cron_alert_to_outbox();
+drop function if exists ops.storage_alert_to_outbox();
+drop function if exists ops.alert_claim(p_limit int);
+drop function if exists ops.alert_mark(p_alert_id bigint, p_ok bool, p_err text);
+drop view if exists ops.v_alert_outbox_health;
+drop table if exists ops.alert_outbox;
+delete from silver.sidnl_config
+ where key in ('alert_delivery_enabled', 'alert_max_attempts', 'alert_claim_timeout_minutes');
+-- if the sidnl-alerts cron was added, also run:
+--   select cron.unschedule('sidnl-alerts');
+-- if pg_net was enabled only for this feature, also run:
+--   drop extension if exists pg_net;

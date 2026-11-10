@@ -16,6 +16,7 @@ Deno.serve(async () => {
   const admin = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { db: { schema: "ops" } },
   );
 
   const { data: alerts, error: claimErr } = await admin.rpc("alert_claim", { p_limit: 10 });
@@ -29,6 +30,7 @@ Deno.serve(async () => {
   }
 
   let delivered = 0;
+  let failed = 0;
   for (const a of alerts) {
     let ok = false, err: string | null = null;
     try {
@@ -46,10 +48,12 @@ Deno.serve(async () => {
     }
     const { error: markErr } = await admin.rpc("alert_mark", {
       p_alert_id: a.alert_id, p_ok: ok, p_err: err });
-    if (!ok && markErr) err = markErr.message;
-    if (ok) delivered++;
+    if (ok && !markErr) delivered++;
+    else failed++;
+    if (markErr) console.error(`Could not record alert ${a.alert_id}: ${markErr.message}`);
   }
 
-  return new Response(JSON.stringify({ ok: true, delivered }), {
+  return new Response(JSON.stringify({ ok: failed === 0, delivered, failed }), {
+    status: failed === 0 ? 200 : 502,
     headers: { "content-type": "application/json" } });
 });
