@@ -1,6 +1,21 @@
 # Fallback mechanisms for Silver and Gold: audit and design
 
-Status: **DRAFT, waiting for approval** (Phase 1 gate). Nothing in this document has been applied to the database.
+Status: **PHASE 2 PARTIALLY IMPLEMENTED (2026-11-10). Phase 3 tests pending.**
+- Gap 1: applied earlier (`dash_006_gold_failure_retry`).
+- Gap 2: **implemented by silver_062_bronze_freshness** (incremental cursor design; freshness alerts land in
+  `ops.cron_alert_log`, `sidnl-freshness` cron every 5 min). Threshold policy lives in `silver.freshness_policy`
+  + `ops.freshness_override` (Q4 applied: set `expected=false` there for instamart/jiomart rows).
+- Gaps 3/4/5 SQL written as **silver_063 (dead-letter, Option A)**, **silver_065 (alert outbox — bridges ALL
+  alert log tables, including silver_062's freshness alerts, to Slack)**, **silver_064 (heartbeat + lock-safe
+  daily cron)**, plus edge functions in `edge-functions/`. **063/064/065 NOT applied to the DB yet** — apply
+  in order 063 → 064 → 065 with admin (Supabase SQL editor); `[ADMIN]` items marked inside the files
+  (Gap 3 loader predicates, run_tick + record_storage_snapshot hooks, cron swap, pg_net, deploy + secrets).
+Decisions taken (2026-11-10, owner): Q1 keep repo layout; Q2 accept "not tested" for
+cron-timing parts; Q3 **Option A**; Q4 expected = blinkit+zepto on all three sources
+(instamart/jiomart not scraped); Q5 pg_net + Slack, at-most-once; Q6 yes to lock-safe daily cron.
+Remaining Phase 3 items marked `[ADMIN]` inside the migration files: loader predicates for
+Gap 3 (needs live loader text), freshness hook in `record_storage_snapshot`, run_tick hook for
+`retry_dead_letters`, cron command swap, pg_net enable, edge-function deploy + secrets.
 Audit date: 2026-11-10, against the live project `jqxnaqbvwgmfkyzfincy`. Everything below was read from the live
 catalog (`pg_get_functiondef`, `cron.job`, `information_schema`), not from the repo copies.
 
