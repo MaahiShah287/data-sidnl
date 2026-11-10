@@ -1,0 +1,3 @@
+-- Rollback for dash_009_brand_scorecard_fast: re-apply the two view definitions from
+-- sql/dash/live/*_dash_008_brand_scorecard.sql with "create view" changed to "create or replace view".
+-- (Same output columns and numbers; only slower.)
