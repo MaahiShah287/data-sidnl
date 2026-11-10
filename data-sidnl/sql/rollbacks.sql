@@ -390,3 +390,42 @@ delete from silver.sidnl_config
 --   select cron.unschedule('sidnl-alerts');
 -- if pg_net was enabled only for this feature, also run:
 --   drop extension if exists pg_net;
+
+-- ==================================================================== 20261110144308 dash_010_refresh_status_stale_means_behind
+-- Restore the dash_006 definition of dash.v_refresh_status (is_stale = last success older than gold_stale_minutes) and the
+-- original config description. Same columns, so nothing depends on it changing.
+update dash.cfg_threshold
+   set description = 'dash.v_refresh_status: a table counts as stale when its last successful refresh is older than this many minutes'
+ where key = 'gold_stale_minutes';
+create or replace view dash.v_refresh_status with (security_invoker = true) as
+select s.table_name, s.last_refreshed_at, round(extract(epoch from now() - s.last_refreshed_at) / 60, 1) as age_minutes,
+       s.row_count, s.last_status, s.last_attempt_at, s.last_error, s.gold_attempts, s.next_retry_at,
+       (s.last_status = 'failed') as refresh_failing,
+       (s.last_status = 'failed' and s.next_retry_at is null) as needs_attention,
+       (s.last_refreshed_at is null
+        or now() - s.last_refreshed_at > make_interval(mins => coalesce(
+               (select c.value from dash.cfg_threshold c where c.key = 'gold_stale_minutes'), 180)::int)) as is_stale
+from dash.refresh_table_state s;
+
+-- ==================================================================== 20261110144713 silver_064_heartbeat
+-- If the sidnl-pipeline-daily command was switched to silver.enqueue_daily_safe, switch it back first:
+--   select cron.unschedule('sidnl-pipeline-daily');
+--   select cron.schedule('sidnl-pipeline-daily', '35 18 * * *', 'select silver.enqueue_daily(''cron-daily'', false)');
+drop function if exists ops.heartbeat();
+drop function if exists silver.enqueue_daily_safe(text);
+drop view if exists ops.v_heartbeat;
+delete from silver.sidnl_config where key in ('heartbeat_pipeline_max_minutes', 'heartbeat_gold_max_minutes', 'heartbeat_daily_max_hours');
+-- (grant usage on schema ops to service_role is shared with silver_065; revoke it only after both are rolled back:
+--  revoke usage on schema ops from service_role;)
+
+-- ==================================================================== 20261110144717 silver_065_alert_outbox
+-- If the delivery cron was scheduled: select cron.unschedule('sidnl-alerts');
+drop trigger if exists trg_cron_alert_outbox on ops.cron_alert_log;
+drop trigger if exists trg_storage_alert_outbox on ops.storage_alert_log;
+drop function if exists ops.cron_alert_to_outbox();
+drop function if exists ops.storage_alert_to_outbox();
+drop function if exists ops.alert_claim(int);
+drop function if exists ops.alert_mark(bigint, bool, text);
+drop view if exists ops.v_alert_outbox_health;
+drop table if exists ops.alert_outbox;   -- undelivered alerts in it are lost; the source rows stay in the alert log tables
+delete from silver.sidnl_config where key in ('alert_delivery_enabled', 'alert_max_attempts', 'alert_claim_timeout_minutes');

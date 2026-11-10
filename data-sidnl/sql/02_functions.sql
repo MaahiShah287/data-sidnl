@@ -350,6 +350,74 @@ begin
 end $function$
 ;
 
+CREATE OR REPLACE FUNCTION ops.alert_claim(p_limit integer DEFAULT 10)
+ RETURNS TABLE(alert_id bigint, source text, severity text, title text, body text, attempts integer)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'ops', 'silver', 'public', 'pg_temp'
+AS $function$ begin
+    if coalesce(silver.cfg('alert_delivery_enabled'), 0) <> 1 then return; end if;
+    update ops.alert_outbox set status = 'failed', last_error = 'reclaimed: stuck in sending past claim timeout'
+     where status = 'sending' and claimed_at < now() - make_interval(mins => coalesce(silver.cfg('alert_claim_timeout_minutes'), 5)::int);
+    return query
+    update ops.alert_outbox o set status = 'sending', claimed_at = now(), attempts = o.attempts + 1
+     where o.alert_id in (select a.alert_id from ops.alert_outbox a where a.status = 'pending' and a.next_attempt_at <= now()
+                           order by a.alert_id for update skip locked limit p_limit)
+     returning o.alert_id, o.source, o.severity, o.title, o.body, o.attempts;
+end $function$
+;
+
+CREATE OR REPLACE FUNCTION ops.alert_mark(p_alert_id bigint, p_ok boolean, p_err text DEFAULT NULL::text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'ops', 'silver', 'public', 'pg_temp'
+AS $function$ begin
+    if p_ok then update ops.alert_outbox set status = 'sent', sent_at = now(), last_error = null where alert_id = p_alert_id;
+    else update ops.alert_outbox o set status = case when o.attempts >= coalesce(silver.cfg('alert_max_attempts'), 6)::int then 'dead' else 'pending' end,
+                next_attempt_at = now() + make_interval(mins => silver.backoff_minutes(o.attempts)), last_error = p_err
+          where o.alert_id = p_alert_id; end if;
+end $function$
+;
+
+CREATE OR REPLACE FUNCTION ops.cron_alert_to_outbox()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'ops', 'silver', 'public', 'pg_temp'
+AS $function$ begin
+    insert into ops.alert_outbox (dedupe_key, source, severity, title, body)
+    values ('cron:' || new.alert_id::text, 'cron', case when new.level = 'alert' then 'warning' else 'info' end,
+            new.jobname || ': ' || new.level,
+            coalesce(new.consecutive_failures::text || ' consecutive failure(s). Last: ' || left(new.last_failure_message, 400), new.level))
+    on conflict (dedupe_key) do nothing;
+    return new;
+exception when others then raise warning 'cron_alert_to_outbox: %', sqlerrm; return new; end $function$
+;
+
+CREATE OR REPLACE FUNCTION ops.heartbeat()
+ RETURNS SETOF ops.v_heartbeat
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'ops', 'silver', 'public', 'pg_temp'
+AS $function$ select * from ops.v_heartbeat $function$
+;
+
+CREATE OR REPLACE FUNCTION ops.storage_alert_to_outbox()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'ops', 'silver', 'public', 'pg_temp'
+AS $function$ begin
+    insert into ops.alert_outbox (dedupe_key, source, severity, title, body)
+    values ('storage:' || new.alert_id::text, 'storage',
+            case when new.level = 'critical' then 'critical' when new.level = 'warning' then 'warning' else 'info' end,
+            'storage ' || new.level, coalesce(new.message || ' (' || new.used_pct::text || '%)', 'storage level: ' || new.level))
+    on conflict (dedupe_key) do nothing;
+    return new;
+exception when others then raise warning 'storage_alert_to_outbox: %', sqlerrm; return new; end $function$
+;
+
 CREATE OR REPLACE FUNCTION silver.approve_match(p_review_id bigint, p_by text DEFAULT SESSION_USER)
  RETURNS text
  LANGUAGE plpgsql
@@ -684,6 +752,15 @@ begin
     returning job_id into v_id;
     return v_id;
 end $function$
+;
+
+CREATE OR REPLACE FUNCTION silver.enqueue_daily_safe(p_reason text)
+ RETURNS bigint
+ LANGUAGE plpgsql
+ SET search_path TO 'silver', 'ops', 'public', 'pg_temp'
+ SET lock_timeout TO '5s'
+AS $function$ begin return silver.enqueue_daily(p_reason, false);
+exception when unique_violation or lock_not_available then return null; end $function$
 ;
 
 CREATE OR REPLACE FUNCTION silver.enrich_product_categories()
@@ -3412,9 +3489,17 @@ end $function$
 
 comment on function dash.refresh(p_visibility_days integer) is 'Rebuilds dash.pricing and dash.availability fully and dash.visibility for the last N days (NULL = all). overview/ads/supply are loaded by their own feeds.';
 
+comment on function ops.alert_claim(p_limit integer) is 'alert-dispatch: returns up to p_limit due pending rows and marks them sending; returns nothing while alert_delivery_enabled = 0.';
+
+comment on function ops.alert_mark(p_alert_id bigint, p_ok boolean, p_err text) is 'alert-dispatch: marks a row sent, or schedules a retry (silver.backoff_minutes) / marks it dead after alert_max_attempts.';
+
+comment on function ops.heartbeat() is 'Rows of ops.v_heartbeat for the heartbeat edge function (service_role only).';
+
 comment on function silver.auto_approve_exact_matches() is 'sidnl-auto-match: approves only exact cross-platform twins from match_review_queue (see silver_058). Fuzzy matches stay for review.';
 
 comment on function silver.dq_checks(p_shelf_max bigint) is 'Severity-classified silver checks. blocks=true means the affected scope must not advance its watermark. scope=all rows are roll-ups.';
+
+comment on function silver.enqueue_daily_safe(p_reason text) is 'silver.enqueue_daily with a 5 s lock_timeout; a lock wait or duplicate returns null instead of failing the cron job (the 18:35 UTC job timed out on 2026-11-09).';
 
 comment on function silver.enrich_product_categories() is 'Fills dim_product.category_key with the deepest scraped category (breadcrumb L1>L2>L3, else shelf L1>L2). Never invents a level.';
 

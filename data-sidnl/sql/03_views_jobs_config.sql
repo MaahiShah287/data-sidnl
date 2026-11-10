@@ -1654,9 +1654,11 @@ create or replace view dash.v_refresh_status with (security_invoker=true) as
     next_retry_at,
     (last_status = 'failed'::text) AS refresh_failing,
     ((last_status = 'failed'::text) AND (next_retry_at IS NULL)) AS needs_attention,
-    ((last_refreshed_at IS NULL) OR ((now() - last_refreshed_at) > make_interval(mins => (COALESCE(( SELECT c.value
-           FROM dash.cfg_threshold c
-          WHERE (c.key = 'gold_stale_minutes'::text)), (180)::numeric))::integer))) AS is_stale
+    ((last_refreshed_at IS NULL) OR (EXISTS ( SELECT 1
+           FROM ops.pipeline_run r
+          WHERE ((r.status = 'success'::text) AND (((r.gold_status = 'pending'::text) AND (r.run_id > COALESCE(s.last_run_id, (0)::bigint))) OR ((r.gold_status = 'failed'::text) AND (r.run_id >= COALESCE(s.last_run_id, (0)::bigint)))) AND (COALESCE(r.finished_at, r.started_at) < (now() - make_interval(mins => (COALESCE(( SELECT c.value
+                   FROM dash.cfg_threshold c
+                  WHERE (c.key = 'gold_stale_minutes'::text)), (180)::numeric))::integer))))))) AS is_stale
    FROM dash.refresh_table_state s;
 
 create or replace view dash.v_brand_scorecard with (security_invoker=true) as
@@ -2028,6 +2030,40 @@ create or replace view ops.v_dead_letter_summary with (security_invoker=true) as
    FROM ops.dead_letter
   GROUP BY source_table, platform, l1_id, l2_id, status;
 
+create or replace view ops.v_heartbeat with (security_invoker=true) as
+ SELECT jobname,
+    active,
+    schedule,
+    ( SELECT max(r.start_time) AS max
+           FROM cron.job_run_details r
+          WHERE (r.jobid = j.jobid)) AS last_start,
+    ( SELECT r.status
+           FROM cron.job_run_details r
+          WHERE (r.jobid = j.jobid)
+          ORDER BY r.start_time DESC
+         LIMIT 1) AS last_status,
+        CASE
+            WHEN (jobname = 'sidnl-pipeline'::text) THEN (now() - make_interval(mins => (COALESCE(silver.cfg('heartbeat_pipeline_max_minutes'::text), (10)::numeric))::integer))
+            WHEN (jobname = 'sidnl-gold'::text) THEN (now() - make_interval(mins => (COALESCE(silver.cfg('heartbeat_gold_max_minutes'::text), (10)::numeric))::integer))
+            WHEN (schedule = ANY (ARRAY['35 18 * * *'::text, '5 19 * * *'::text, '20 19 * * *'::text, '40 19 * * *'::text])) THEN (now() - make_interval(hours => (COALESCE(silver.cfg('heartbeat_daily_max_hours'::text), (26)::numeric))::integer))
+            WHEN (schedule = '* * * * *'::text) THEN (now() - '00:10:00'::interval)
+            WHEN (schedule = '*/5 * * * *'::text) THEN (now() - '00:15:00'::interval)
+            WHEN (schedule = '*/10 * * * *'::text) THEN (now() - '00:20:00'::interval)
+            WHEN (schedule = '*/15 * * * *'::text) THEN (now() - '00:45:00'::interval)
+            ELSE (now() - '25:00:00'::interval)
+        END AS expected_by
+   FROM cron.job j
+  WHERE (jobname ~~ 'sidnl-%'::text);
+
+create or replace view ops.v_alert_outbox_health with (security_invoker=true) as
+ SELECT count(*) FILTER (WHERE (status = 'pending'::text)) AS pending,
+    count(*) FILTER (WHERE (status = 'sending'::text)) AS sending,
+    count(*) FILTER (WHERE (status = 'sent'::text)) AS sent,
+    count(*) FILTER (WHERE (status = 'failed'::text)) AS failed,
+    count(*) FILTER (WHERE (status = 'dead'::text)) AS dead,
+    max((now() - created_at)) FILTER (WHERE (status = 'pending'::text)) AS oldest_pending_age
+   FROM ops.alert_outbox;
+
 comment on view dash.v_brand_scorecard is 'Brand scorecard per obs_date x platform x city (ALL = all cities) x brand, built only from dash.visibility/availability/pricing. Every % has its num/den; roll up as SUM(num)/SUM(den). NULL = not measured (category shelves: Blinkit; availability/pricing: client brands). shelf impressions are 0 only when that day''s shelves were tracked and the brand did not appear.';
 
 comment on view dash.v_brand_scorecard_latest is 'dash.v_brand_scorecard: the latest obs_date that has any data for each platform x brand x city (obs_date is in the row, so a brand sees how recent its numbers are).';
@@ -2036,13 +2072,17 @@ comment on view dash.v_data_freshness is 'Bronze freshness per platform x source
 
 comment on view dash.v_platform_freshness is 'One row per platform for the "data stale" banner: no_data | stale (any source that had data is stale) | fresh.';
 
-comment on view dash.v_refresh_status is 'App "last refreshed" badge: one row per dash table. is_stale = last success older than cfg_threshold.gold_stale_minutes. refresh_failing = latest attempt failed (old data still served). needs_attention = failed and no retry scheduled (permanent error or attempts exhausted).';
+comment on view dash.v_refresh_status is 'App "last refreshed" badge: one row per dash table. is_stale = dash is BEHIND silver: a successful silver run newer than the one dash reflects has waited for gold longer than cfg_threshold.gold_stale_minutes (quiet scrapers do not make dash stale; see dash.v_platform_freshness for that). refresh_failing = latest attempt failed (old data still served). needs_attention = failed and no retry scheduled.';
 
 comment on view dash.v_valid_reading is 'silver.v_reading limited to dq_status=valid and non-test platforms. Single entry point for all gold metrics.';
+
+comment on view ops.v_alert_outbox_health is 'Alert outbox summary: pending > 0 = delivery behind; dead > 0 needs attention; all zero while delivery is off and no alerts exist.';
 
 comment on view ops.v_cron_health is 'Per-cron-job health for sidnl-* jobs incl. failures that bypass silver.pipeline_job (statement timeouts).';
 
 comment on view ops.v_dq_summary is 'How many readings carry each data-quality flag.';
+
+comment on view ops.v_heartbeat is 'One row per sidnl-* cron job: schedule, last start/status, expected_by (the time it should have started after). Read by the heartbeat edge function through ops.heartbeat().';
 
 comment on view ops.v_pipeline_status is 'One-row health check of the automatic pipeline and the canonical map.';
 
@@ -2126,13 +2166,19 @@ do $g$ begin
 end $g$;
 
 do $g$ begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant USAGE on schema ops to service_role;
+  end if;
+end $g$;
+
+do $g$ begin
   if exists (select 1 from pg_roles where rolname = 'sidnl_chatbot_app') then
     grant USAGE on schema silver to sidnl_chatbot_app;
   end if;
 end $g$;
 
 insert into dash.cfg_threshold select * from json_populate_recordset(null::dash.cfg_threshold, '[{"key":"critical_osa_pct","value":50,"value_text":null,"description":"SKU x city is critical when latest OSA % is below this","is_confirmed":false,"updated_at":"2026-11-06T16:14:05.232042+00:00"}, 
- {"key":"gold_stale_minutes","value":180,"value_text":null,"description":"dash.v_refresh_status: a table counts as stale when its last successful refresh is older than this many minutes","is_confirmed":false,"updated_at":"2026-11-10T09:48:54.499448+00:00"}, 
+ {"key":"gold_stale_minutes","value":180,"value_text":null,"description":"dash.v_refresh_status.is_stale: dash is behind silver - a successful silver run has been waiting for its gold refresh (pending or failed) longer than this many minutes","is_confirmed":false,"updated_at":"2026-11-10T09:48:54.499448+00:00"}, 
  {"key":"low_stock_fe_units","value":5,"value_text":null,"description":"Dark store counts as low stock when FE units <= this (dash.availability.low_stock_stores).","is_confirmed":false,"updated_at":"2026-11-09T10:11:47.537358+00:00"}, 
  {"key":"min_scan_depth_cards","value":20,"value_text":null,"description":"A stopped-early brand-search scan counts as shallow (listing % may undercount) only if it read fewer cards than this. Observed: stopped-early scans read 61-112 cards; brand cards rank within the first 5 positions.","is_confirmed":false,"updated_at":"2026-11-06T16:29:33.551481+00:00"}, 
  {"key":"parity_reference_platform","value":null,"value_text":"blinkit","description":"Reference platform for cross-platform price difference","is_confirmed":false,"updated_at":"2026-11-06T16:14:05.232042+00:00"}, 
@@ -2214,7 +2260,10 @@ insert into silver.ref_variant_synonym select * from json_populate_recordset(nul
  {"syn_key":"xxl","variant":"xxl","is_active":true}, 
  {"syn_key":"zero","variant":"zero","is_active":true}]') on conflict do nothing;
 
-insert into silver.sidnl_config select * from json_populate_recordset(null::silver.sidnl_config, '[{"key":"auto_match_exact_enabled","value_num":1,"value_text":null,"description":"1 = sidnl-auto-match approves pending reviews that are exact cross-platform twins (same brand, same normalized name, same parsed size/unit/pack); 0 = off. Fuzzy matches are never auto-approved."}, 
+insert into silver.sidnl_config select * from json_populate_recordset(null::silver.sidnl_config, '[{"key":"alert_claim_timeout_minutes","value_num":5,"value_text":null,"description":"rows stuck in sending longer than this are marked failed (at-most-once)"}, 
+ {"key":"alert_delivery_enabled","value_num":0,"value_text":null,"description":"1 = the edge function may deliver outbox rows; 0 = collect only"}, 
+ {"key":"alert_max_attempts","value_num":6,"value_text":null,"description":"delivery attempts before an alert row is marked dead"}, 
+ {"key":"auto_match_exact_enabled","value_num":1,"value_text":null,"description":"1 = sidnl-auto-match approves pending reviews that are exact cross-platform twins (same brand, same normalized name, same parsed size/unit/pack); 0 = off. Fuzzy matches are never auto-approved."}, 
  {"key":"auto_merge_fuzzy","value_num":0,"value_text":null,"description":"1 = score >= th_auto merges automatically; 0 (default) = only exact brand+name+pack matches merge, fuzzy matches go to match_review_queue"}, 
  {"key":"brand_min_sim","value_num":0.60,"value_text":null,"description":"Check 3 - below this two brands are in conflict"}, 
  {"key":"category_chunk_rows","value_num":50000,"value_text":null,"description":"refresh_category_market reads bronze shelf cards in id chunks of this size"}, 
@@ -2228,6 +2277,9 @@ insert into silver.sidnl_config select * from json_populate_recordset(null::silv
  {"key":"freshness_lookback_rows","value_num":1000,"value_text":null,"description":"sidnl-freshness re-reads this many bronze ids below its cursor each run (late-committed rows)"}, 
  {"key":"gold_max_attempts","value_num":5,"value_text":null,"description":"Gold (dash) refresh: a transient failure is retried until this many attempts; permanent errors are never retried"}, 
  {"key":"gold_visibility_days","value_num":null,"value_text":null,"description":"Days of dash.visibility rebuilt per gold refresh. NULL = all dates (required: visibility is keyed by sidnl_id and SI ids are renumbered A-Z)"}, 
+ {"key":"heartbeat_daily_max_hours","value_num":26,"value_text":null,"description":"max age of last daily run start before heartbeat is overdue"}, 
+ {"key":"heartbeat_gold_max_minutes","value_num":10,"value_text":null,"description":"max age of last cron run start for sidnl-gold before heartbeat is overdue"}, 
+ {"key":"heartbeat_pipeline_max_minutes","value_num":10,"value_text":null,"description":"max age of last cron run start for sidnl-pipeline before heartbeat is overdue"}, 
  {"key":"incremental_lookback_rows","value_num":5000,"value_text":null,"description":"Incremental parser re-reads this many ids before the watermark (late-committed rows)"}, 
  {"key":"pipeline_min_interval_seconds","value_num":120,"value_text":null,"description":"run_pipeline() will not start again sooner than this after the previous run (incremental loads are cheap)"}, 
  {"key":"reconcile_window_days","value_num":3,"value_text":null,"description":"sidnl-reconcile compares silver facts loaded in the last N days with their bronze rows (dash checks are always full)"}, 

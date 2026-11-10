@@ -106,7 +106,7 @@ bronze scrape snapshots (`ops.store_city_filled`); stores whose snapshots name t
 
 Rules: product = `sidnl_id`; each metric stored once; **every % has its numerator and denominator** (roll up as
 SUM(num)/SUM(den), never AVG(%)); never add store rows and city rows together.
-Views: `v_refresh_status` (last refreshed / stale / failing per table), `v_data_freshness`, `v_platform_freshness`,
+Views: `v_refresh_status` (last refreshed; `is_stale` = dash is behind silver, i.e. a successful silver run has waited for gold longer than `gold_stale_minutes`; failing; needs attention), `v_data_freshness`, `v_platform_freshness`,
 `v_brand_scorecard` + `v_brand_scorecard_latest` (per date × platform × city/ALL × brand: share of shelf and rank,
 OSA %, listing %, stock-outs, average discount, parity breaks; NULL = not measured), `v_valid_reading`.
 Coverage today: category shelves exist for Blinkit only; availability and pricing for client brands only; OSA (stock
@@ -129,8 +129,8 @@ latest per check in `ops.v_reconciliation_latest`. Any mismatch writes an alert 
 | 1 Gold failure | **live** (`dash_006`, `dash_007`) | failed refresh = gold `failed`, backoff via `classify_error` / `backoff_minutes`, max `gold_max_attempts` (5); statement timeout caught; previous dash rows kept (savepoint) |
 | 2 Stale scraper | **live** (`silver_062`) | bronze freshness per platform × source via id cursor; thresholds `silver.freshness_policy` (stock 48 h, search 24 h, shelf 72 h) + `ops.freshness_override`; status fresh / stale / never_seen / not_expected; events `ops.freshness_event`; alert on stale |
 | 3 Bad rows | **live** (`silver_063`, category shelves) | chunk fails with a permanent error → bisect to the failing bronze rows → `ops.dead_letter`; rest loads; retry 15 min with backoff; > 100 rows/chunk or transient error → scope fails as before. Client-brand loader keeps per-brand isolation |
-| 4 Alert delivery | **not built** | design: outbox fed by triggers on the alert logs, `alert-dispatch` edge function to Slack, disabled until the owner sets the secret; draft in git history (commit b314c08, its trigger read columns that do not exist) |
-| 5 Cron never starts | **not built** | design: `ops.v_heartbeat` + `heartbeat` edge function returning 200/503, polled by an external uptime monitor |
+| 4 Alert delivery | **database side live** (`silver_065`), delivery off | triggers copy `ops.cron_alert_log` and `ops.storage_alert_log` rows into `ops.alert_outbox` (deduped `<table>:<alert_id>`); `alert-dispatch` edge function claims (`ops.alert_claim`), posts to Slack, reports (`ops.alert_mark`); at-most-once, backoff 2/4/8/16 min, `dead` after 6; switched on by `alert_delivery_enabled = 1` once the owner sets the Slack secret, enables pg_net and schedules `sidnl-alerts` (README owner steps) |
+| 5 Cron never starts | **database side live** (`silver_064`), endpoint not deployed | `ops.v_heartbeat` (one row per `sidnl-*` job: schedule, last start/status, expected_by) read through `ops.heartbeat()`; `heartbeat` edge function returns 200/503 to an external uptime monitor; `silver.enqueue_daily_safe()` for a lock-safe daily job (cron command not switched yet) |
 
 Alert rows today (all in `ops.cron_alert_log`): cron failures (3 in a row), `freshness:<platform>/<source>`,
 `sidnl-reconcile:data`, `sidnl-reconcile:coverage`, `dead-letter:<scope>`; storage levels in `ops.storage_alert_log`.
@@ -151,5 +151,5 @@ Alert rows today (all in `ops.cron_alert_log`): cron failures (3 in a row), `fre
 - 2026-11-10: `dash_006` gold retry; `silver_056` pack parser (2,106 products corrected); `dash_007` full visibility
   rebuild (10,427 rows had stale SI ids); `silver_057` first-seen dates; `silver_058` exact cross-platform auto-match;
   `silver_059` maintenance job; `dash_008`/`009` brand scorecard; `silver_060` store city from snapshots (111,569 shelf
-  rows gained a city); `silver_061` reconciliation; `silver_062` freshness; `silver_063` dead letters.
+  rows gained a city); `silver_061` reconciliation; `silver_062` freshness; `silver_063` dead letters; `dash_010` `is_stale` fixed to mean "behind silver" (it flagged every table stale after 3 h of quiet scrapers); `silver_064` heartbeat view + lock-safe daily wrapper; `silver_065` alert outbox (delivery off).
 - Repo consolidated 2026-11-10 from 174 files to the layout in README.md (old files remain in git history).

@@ -347,6 +347,23 @@ create table if not exists dash.visibility (
     refreshed_at timestamp with time zone default now() not null
 );
 
+create table if not exists ops.alert_outbox (
+    alert_id bigint generated always as identity not null,
+    dedupe_key text not null,
+    source text not null,
+    severity text default 'warning'::text not null,
+    title text not null,
+    body text,
+    created_at timestamp with time zone default now() not null,
+    status text default 'pending'::text not null,
+    attempts integer default 0 not null,
+    next_attempt_at timestamp with time zone default now() not null,
+    claimed_at timestamp with time zone,
+    sent_at timestamp with time zone,
+    last_error text,
+    channel text default 'slack'::text not null
+);
+
 create table if not exists ops.backup_silver_057 (
     product_key integer,
     first_seen_at timestamp with time zone
@@ -874,6 +891,16 @@ alter table dash.visibility add constraint visibility_pkey PRIMARY KEY (obs_date
 
 alter table dash.visibility add constraint visibility_search_type_check CHECK ((search_type = ANY (ARRAY['category'::text, 'keyword'::text])));
 
+alter table ops.alert_outbox add constraint alert_outbox_dedupe_key_key UNIQUE (dedupe_key);
+
+alter table ops.alert_outbox add constraint alert_outbox_pkey PRIMARY KEY (alert_id);
+
+alter table ops.alert_outbox add constraint alert_outbox_severity_check CHECK ((severity = ANY (ARRAY['info'::text, 'warning'::text, 'critical'::text])));
+
+alter table ops.alert_outbox add constraint alert_outbox_source_check CHECK ((source = ANY (ARRAY['cron'::text, 'storage'::text, 'freshness'::text, 'gold'::text, 'dead_letter'::text, 'heartbeat'::text])));
+
+alter table ops.alert_outbox add constraint alert_outbox_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sending'::text, 'sent'::text, 'failed'::text, 'dead'::text, 'disabled'::text])));
+
 alter table ops.cron_alert_log add constraint cron_alert_log_level_check CHECK ((level = ANY (ARRAY['alert'::text, 'recovered'::text])));
 
 alter table ops.cron_alert_log add constraint cron_alert_log_pkey PRIMARY KEY (alert_id);
@@ -1098,6 +1125,8 @@ CREATE INDEX ix_dim_sidnl_brand ON dash.dim_sidnl USING btree (brand_key);
 
 CREATE UNIQUE INDEX supply_key ON dash.supply USING btree (platform, po_number, sidnl_id, invoice_id) NULLS NOT DISTINCT;
 
+CREATE INDEX alert_outbox_pending_idx ON ops.alert_outbox USING btree (next_attempt_at) WHERE (status = 'pending'::text);
+
 CREATE INDEX ix_dead_letter_open ON ops.dead_letter USING btree (bronze_id) WHERE (status = 'open'::text);
 
 CREATE INDEX dq_result_run_idx ON ops.dq_result USING btree (run_id);
@@ -1198,6 +1227,8 @@ alter table dash.supply enable row level security;
 
 alter table dash.visibility enable row level security;
 
+alter table ops.alert_outbox enable row level security;
+
 alter table ops.backup_silver_057 enable row level security;
 
 alter table ops.cron_alert_log enable row level security;
@@ -1253,6 +1284,8 @@ comment on table dash.refresh_table_state is 'One row per dash table rewritten b
 comment on table dash.supply is 'Purchase Orders, Invoices, EDI and RCA warehouse/PO tabs: one row per PO line (x invoice). Fill rate roll-ups = SUM(grn_units)/SUM(po_units). Loaded by the vendor-portal/ERP/EDI feed.';
 
 comment on table dash.visibility is 'Visibility tab: rank, impressions and SOV per SKU per category shelf (l1>l2) or keyword. SOV of a brand = sum over its SKUs in the same market. Keyword rows have no SOV (brand-only results).';
+
+comment on table ops.alert_outbox is 'Alert delivery queue (silver_065). One row per dedupe_key; filled by triggers on the alert log tables; delivery controlled by silver.sidnl_config.alert_delivery_enabled.';
 
 comment on table ops.backup_silver_057 is 'Rollback data for silver_057 (dim_product.first_seen_at before the correction). Safe to drop once silver_057 is accepted.';
 

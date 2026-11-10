@@ -3,8 +3,8 @@
 // 200 = nothing overdue; 503 = something overdue OR database unreachable.
 // Deploy:  supabase functions deploy heartbeat --no-verify-jwt
 //
-// ops.v_heartbeat is in the 'ops' schema; supabase-js .from() defaults to
-// the public schema, so we pass { db: { schema: 'ops' } } to the client.
+// The data comes from ops.heartbeat() (SECURITY DEFINER, schema 'ops'), called with { db: { schema: 'ops' } }.
+// Requires schema 'ops' in Dashboard > Project Settings > API > Exposed schemas.
 
 declare const Deno: {
   env: {
@@ -25,16 +25,19 @@ Deno.serve(async () => {
     const { createClient } = (await import("https://esm.sh/@supabase/supabase-js@2")) as any;
     const admin = createClient(supabaseUrl, serviceRoleKey, { db: { schema: "ops" } });
 
-    // .from() resolves to ops.v_heartbeat (schema set above)
-    const { data, error } = await admin.from("v_heartbeat").select("*");
+    // service_role has no direct access to ops.v_heartbeat; read it through the SECURITY DEFINER function ops.heartbeat()
+    const { data, error } = await admin.rpc("heartbeat");
     if (error) throw new Error(error.message);
 
-    // v_heartbeat rows: jobname, active, last_start, last_status, expected_by
+    // v_heartbeat rows: jobname, active, schedule, last_start, last_status, expected_by
+    // A job that has never run is only overdue if it should have run by now: daily jobs ("m h * * *") that have not
+    // reached their first scheduled time yet are fine.
+    const isDaily = (r: any) => /^\d+ \d+ \* \* \*$/.test(String(r.schedule ?? ""));
     const isOverdue = (r: any) =>
       r.active === false ||
-      !r.last_start ||
+      (!r.last_start && !isDaily(r)) ||
       r.last_status === "failed" ||
-      new Date(r.last_start) < new Date(r.expected_by);
+      (r.last_start && new Date(r.last_start) < new Date(r.expected_by));
     const overdue = (data ?? []).filter(isOverdue);
 
     const body = {

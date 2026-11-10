@@ -4,6 +4,7 @@
 // Secrets (set YOURSELF, never commit):
 //   supabase secrets set SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 // Cron sidnl-alerts (or the external monitor) POSTs here every minute.
+// Calls ops.alert_claim / ops.alert_mark: schema 'ops' must be in Dashboard > Project Settings > API > Exposed schemas.
 
 declare const Deno: {
   env: {
