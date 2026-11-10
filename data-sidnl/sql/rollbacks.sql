@@ -429,3 +429,12 @@ drop function if exists ops.alert_mark(bigint, bool, text);
 drop view if exists ops.v_alert_outbox_health;
 drop table if exists ops.alert_outbox;   -- undelivered alerts in it are lost; the source rows stay in the alert log tables
 delete from silver.sidnl_config where key in ('alert_delivery_enabled', 'alert_max_attempts', 'alert_claim_timeout_minutes');
+
+-- ==================================================================== 20261110145747 silver_066_alert_delivery
+select cron.unschedule('sidnl-alerts');
+drop function if exists silver.deliver_alerts();
+drop function if exists silver.send_test_alert();
+drop function if exists silver.slack_text(text, text, text, text);
+alter table ops.alert_outbox drop column if exists request_id;
+-- pg_net is left installed (other things may use it); to remove: drop extension pg_net;
+-- The Vault secret slack_webhook_url is not touched; to remove it: delete from vault.secrets where name = 'slack_webhook_url';

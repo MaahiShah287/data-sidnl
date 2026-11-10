@@ -361,7 +361,8 @@ create table if not exists ops.alert_outbox (
     claimed_at timestamp with time zone,
     sent_at timestamp with time zone,
     last_error text,
-    channel text default 'slack'::text not null
+    channel text default 'slack'::text not null,
+    request_id bigint
 );
 
 create table if not exists ops.backup_silver_057 (
@@ -1286,6 +1287,8 @@ comment on table dash.supply is 'Purchase Orders, Invoices, EDI and RCA warehous
 comment on table dash.visibility is 'Visibility tab: rank, impressions and SOV per SKU per category shelf (l1>l2) or keyword. SOV of a brand = sum over its SKUs in the same market. Keyword rows have no SOV (brand-only results).';
 
 comment on table ops.alert_outbox is 'Alert delivery queue (silver_065). One row per dedupe_key; filled by triggers on the alert log tables; delivery controlled by silver.sidnl_config.alert_delivery_enabled.';
+
+comment on column ops.alert_outbox.request_id is 'pg_net request id of the send in flight; cleared when the response is processed.';
 
 comment on table ops.backup_silver_057 is 'Rollback data for silver_057 (dim_product.first_seen_at before the correction). Safe to drop once silver_057 is accepted.';
 

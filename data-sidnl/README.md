@@ -25,7 +25,7 @@ ops     run history, quality results, alerts, checks       (ops.*)
 | `sql/manifest.csv` | every applied migration: version, name, md5 of the applied SQL |
 | `sidnl.py` | command line (below) |
 | `tests/test_live_db.py` | tests against the live database (skipped without `SUPABASE_DB_URL`) |
-| `edge-functions/` | `alert-dispatch` (Slack delivery, Gap 4) and `heartbeat` (uptime check, Gap 5); not deployed, see owner steps below |
+| `edge-functions/heartbeat/` | uptime check for Gap 5 (not deployed, see owner steps below) |
 | `portal/` | Next.js dashboard reading `dash.*` |
 
 `sql/01..03` are **generated** from the live database (`python sidnl.py export-schema`) and checked by
@@ -56,6 +56,7 @@ python -m unittest discover -s tests -v
 | `sidnl-maintenance` | 19:05 UTC | purges cron history > 14 days, analyzes tables without statistics |
 | `sidnl-reconcile` | 19:20 UTC | proves every silver row equals its bronze row and every dash number equals silver |
 | `sidnl-reconcile-coverage` | 19:40 UTC | proves no bronze shelf row was skipped (in silver or dead-lettered) |
+| `sidnl-alerts` | every minute | `silver.deliver_alerts()`: sends queued alerts to Slack (off until you add the webhook and switch it on) |
 
 ## Where to look
 ```sql
@@ -81,18 +82,18 @@ select * from dash.v_brand_scorecard_latest where brand_key = 'amul';  -- a bran
 | Numbers stop matching bronze | `ops.v_reconciliation_latest` mismatch, alert `sidnl-reconcile:data` | nothing is changed automatically | investigate before trusting the dashboard |
 | A cron job keeps failing | `ops.v_cron_health.consecutive_failures >= 3`, `ops.cron_alert_log` | alert row; `recovered` row when it heals | read `cron.job_run_details.return_message` |
 | Cron itself / the database stops | nothing inside the database can tell | — | External uptime monitor polling the `heartbeat` edge function every 5 min (see owner steps) |
-| Alerts reach nobody | alert rows in `ops.cron_alert_log`, `ops.alert_outbox` | outbox retries with backoff; row goes `dead` after 6 attempts | set `alert_delivery_enabled = 1` after Slack secret is set (see owner steps) |
+| Alerts reach nobody | `ops.alert_outbox`, `ops.v_alert_outbox_health` | rows retry with backoff (2/4/8/16 min), `dead` after 6 | check `slack_webhook_url` in Vault and `alert_delivery_enabled = 1`; see owner steps |
 
 ## Owner steps to activate alerts and heartbeat (Gaps 4 and 5)
 The database side is **built and applied** (`silver_064_heartbeat`, `silver_065_alert_outbox`): `ops.v_heartbeat`,
 `ops.heartbeat()`, `silver.enqueue_daily_safe()`, the alert outbox with triggers, `ops.alert_claim()` / `ops.alert_mark()`.
 Delivery is **off** (`alert_delivery_enabled = 0`); alerts are collected in `ops.alert_outbox` once delivery is on.
-What is left needs your accounts and decisions (nothing below has been done, and the edge functions have **not been
-deployed or tested** - only the database side was tested):
+What is left needs your accounts and decisions (nothing below has been done, and the heartbeat edge function has **not been
+deployed or tested** - only the database side was tested; Gap 4 needs no edge function):
 
-0. **Both functions** call `ops.*` through Supabase's REST API, which exposes only `public` by default: add `ops` under
-   Dashboard > Project Settings > API > Exposed schemas first (`ops` tables stay unreadable: RLS is on and only
-   `service_role` can call the two definer functions).
+0. **The heartbeat function** calls `ops.heartbeat()` through Supabase's REST API, which exposes only `public` by default: add
+   `ops` under Dashboard > Project Settings > API > Exposed schemas first (`ops` tables stay unreadable: RLS is on and only
+   `service_role` can call the definer function).
 
 ### Gap 5 - heartbeat (uptime monitoring)
 1. `supabase functions deploy heartbeat --no-verify-jwt`
@@ -107,27 +108,19 @@ deployed or tested** - only the database side was tested):
    ```
    then `python sidnl.py export-schema`, `python sidnl.py verify`, commit.
 
-### Gap 4 - alert delivery (Slack)
-1. Put the Slack webhook in the edge function's secrets yourself (never in a file or chat):
-   `supabase secrets set SLACK_WEBHOOK_URL=...`
-2. `supabase functions deploy alert-dispatch`
-3. Enable `pg_net` (dashboard > Database > Extensions) and store the service-role key in Vault
-   (`select vault.create_secret('<service-role-key>', 'service_role_key');`).
-4. Schedule the sender:
+### Gap 4 - alert delivery (Slack): built and applied (`silver_066_alert_delivery`), switched OFF
+Alerts are sent **from the database** (pg_net, installed) by the `sidnl-alerts` cron job. No edge function, no exposed
+schema, no service-role key. Two things are left, and only you can do them (the webhook is a secret: never paste it in
+chat or a file):
+1. In the Supabase SQL editor, store your Slack incoming-webhook URL in Vault:
+   `select vault.create_secret('https://hooks.slack.com/services/...', 'slack_webhook_url');`
+2. Switch delivery on and send a test:
    ```sql
-   select cron.schedule('sidnl-alerts', '* * * * *', $cmd$
-     set statement_timeout = '30s';
-     select net.http_post(
-       url     := 'https://jqxnaqbvwgmfkyzfincy.supabase.co/functions/v1/alert-dispatch',
-       headers := jsonb_build_object('Authorization', 'Bearer ' || (select decrypted_secret from vault.decrypted_secrets where name = 'service_role_key')),
-       body    := '{}'::jsonb);
-   $cmd$);
+   update silver.sidnl_config set value_num = 1 where key = 'alert_delivery_enabled';
+   select silver.send_test_alert();     -- a "Test alert" should appear in Slack within a minute
    ```
-5. Switch delivery on: `update silver.sidnl_config set value_num = 1 where key = 'alert_delivery_enabled';`
-6. `python sidnl.py export-schema`, `python sidnl.py verify`, commit and push.
-
-Delivery is at-most-once (a crash mid-send marks the row `failed`, never resends) with retries at 2/4/8/16 min and
-`dead` after 6 attempts. Tested in a rolled-back transaction against the real freshness and storage checkers.
+Check: `select * from ops.v_alert_outbox_health;` and `select status, attempts, last_error from ops.alert_outbox order by alert_id desc limit 10;`
+To stop: `update silver.sidnl_config set value_num = 0 where key = 'alert_delivery_enabled';`
 
 ## Changing the database (the only way)
 1. Write a migration `silver_NNN_slug` / `dash_NNN_slug`.

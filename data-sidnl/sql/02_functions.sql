@@ -621,6 +621,44 @@ AS $function$
 $function$
 ;
 
+CREATE OR REPLACE FUNCTION silver.deliver_alerts()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SET search_path TO 'silver', 'ops', 'public', 'pg_temp'
+AS $function$
+declare v_url text; r record; v_req bigint; v_ok int := 0; v_retry int := 0; v_sent int := 0;
+begin
+    if coalesce(silver.cfg('alert_delivery_enabled'), 0) <> 1 then return jsonb_build_object('status', 'disabled'); end if;
+    select decrypted_secret into v_url from vault.decrypted_secrets where name = 'slack_webhook_url' order by created_at desc limit 1;
+    if v_url is null or v_url !~ '^https://' then return jsonb_build_object('status', 'no webhook secret'); end if;
+    -- 1. settle sends made by earlier runs
+    for r in select o.alert_id, h.status_code, h.error_msg
+               from ops.alert_outbox o join net._http_response h on h.id = o.request_id
+              where o.status = 'sending' loop
+        if r.status_code between 200 and 299 then
+            perform ops.alert_mark(r.alert_id, true); v_ok := v_ok + 1;
+        else
+            perform ops.alert_mark(r.alert_id, false,
+                    left(coalesce('slack responded ' || r.status_code::text, 'no response: ' || r.error_msg, 'no response'), 300));
+            v_retry := v_retry + 1;
+        end if;
+        update ops.alert_outbox set request_id = null where alert_id = r.alert_id;
+    end loop;
+    -- 2. send due rows (ops.alert_claim also marks rows stuck in 'sending' as failed)
+    for r in select * from ops.alert_claim(10) loop
+        begin
+            v_req := net.http_post(url := v_url, body := jsonb_build_object('text', silver.slack_text(r.severity, r.title, r.body, r.source)),
+                                   timeout_milliseconds := 5000);
+            update ops.alert_outbox set request_id = v_req where alert_id = r.alert_id;
+            v_sent := v_sent + 1;
+        exception when others then
+            perform ops.alert_mark(r.alert_id, false, left('send failed: ' || replace(sqlerrm, v_url, '[webhook]'), 300));
+        end;
+    end loop;
+    return jsonb_build_object('status', 'ok', 'delivered', v_ok, 'will_retry', v_retry, 'sent_now', v_sent);
+end $function$
+;
+
 CREATE OR REPLACE FUNCTION silver.dq_checks(p_shelf_max bigint DEFAULT NULL::bigint)
  RETURNS TABLE(check_name text, severity text, scope text, violations bigint, total bigint, ok boolean, blocks boolean, detail text)
  LANGUAGE sql
@@ -3278,6 +3316,18 @@ end
 $function$
 ;
 
+CREATE OR REPLACE FUNCTION silver.send_test_alert()
+ RETURNS text
+ LANGUAGE plpgsql
+ SET search_path TO 'silver', 'ops', 'public', 'pg_temp'
+AS $function$ begin
+    insert into ops.alert_outbox (dedupe_key, source, severity, title, body)
+    values ('test:' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISSUS'), 'heartbeat', 'info', 'Test alert',
+            'Sent by silver.send_test_alert(). If you can read this, alert delivery works.');
+    return 'queued; it is sent within a minute if alert_delivery_enabled = 1 and the Vault secret slack_webhook_url exists';
+end $function$
+;
+
 CREATE OR REPLACE FUNCTION silver.sidnl_everything(p_id text, p_row_limit integer DEFAULT 1000)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -3401,6 +3451,15 @@ AS $function$
 $function$
 ;
 
+CREATE OR REPLACE FUNCTION silver.slack_text(p_severity text, p_title text, p_body text, p_source text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$ select replace(replace(replace(
+        format('*[SIDNL %s]* %s', p_severity, p_title) || case when coalesce(p_body, '') <> '' then E'\n' || p_body else '' end
+        || E'\n(source: ' || p_source || ')', '&', '&amp;'), '<', '&lt;'), '>', '&gt;') $function$
+;
+
 CREATE OR REPLACE FUNCTION silver.storage_usage()
  RETURNS TABLE(db_bytes bigint, wal_bytes bigint, used_bytes bigint, plan_bytes bigint, used_pct numeric, level text)
  LANGUAGE plpgsql
@@ -3497,6 +3556,8 @@ comment on function ops.heartbeat() is 'Rows of ops.v_heartbeat for the heartbea
 
 comment on function silver.auto_approve_exact_matches() is 'sidnl-auto-match: approves only exact cross-platform twins from match_review_queue (see silver_058). Fuzzy matches stay for review.';
 
+comment on function silver.deliver_alerts() is 'sidnl-alerts (every minute): settle earlier Slack sends, then post due outbox rows. Off while alert_delivery_enabled = 0 or the Vault secret slack_webhook_url is missing.';
+
 comment on function silver.dq_checks(p_shelf_max bigint) is 'Severity-classified silver checks. blocks=true means the affected scope must not advance its watermark. scope=all rows are roll-ups.';
 
 comment on function silver.enqueue_daily_safe(p_reason text) is 'silver.enqueue_daily with a 5 s lock_timeout; a lock wait or duplicate returns null instead of failing the cron job (the 18:35 UTC job timed out on 2026-11-09).';
@@ -3539,4 +3600,8 @@ comment on function silver.run_maintenance() is 'sidnl-maintenance (daily): purg
 
 comment on function silver.run_pipeline(p_force boolean, p_trigger text) is 'Automatic bronze -> silver -> SI ids -> gold. p_force = run even with no new data. Called every minute by pg_cron.';
 
+comment on function silver.send_test_alert() is 'Owner helper: queues one info alert to verify Slack delivery end to end.';
+
 comment on function silver.sidnl_everything(p_id text, p_row_limit integer) is 'All rows for one SI id across every silver/gold table and platform, as jsonb.';
+
+comment on function silver.slack_text(p_severity text, p_title text, p_body text, p_source text) is 'Slack message text for an alert: *[SIDNL severity]* title, body, source; & < > escaped for Slack.';

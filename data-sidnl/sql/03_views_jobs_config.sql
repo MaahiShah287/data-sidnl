@@ -2296,6 +2296,8 @@ insert into silver.sidnl_config select * from json_populate_recordset(null::silv
  {"key":"w_size","value_num":0.20,"value_text":null,"description":"Check 2 - quantity / pack size agreement weight"}, 
  {"key":"w_variant","value_num":0.15,"value_text":null,"description":"Check 2 - variant agreement weight"}]') on conflict do nothing;
 
+select cron.schedule('sidnl-alerts', '* * * * *', 'set statement_timeout = ''30s''; select silver.deliver_alerts()');
+
 select cron.schedule('sidnl-auto-match', '*/10 * * * *', 'set statement_timeout = ''120s''; select silver.auto_approve_exact_matches()');
 
 select cron.schedule('sidnl-dead-letter', '*/15 * * * *', 'set statement_timeout = ''300s''; select silver.retry_dead_letters()');
