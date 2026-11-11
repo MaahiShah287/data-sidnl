@@ -60,6 +60,7 @@ python -m unittest discover -s tests -v
 | `sidnl-reconcile` | 19:20 UTC | proves every silver row equals its bronze row and every dash number equals silver |
 | `sidnl-reconcile-coverage` | 19:40 UTC | proves no bronze shelf row was skipped (in silver or dead-lettered) |
 | `sidnl-context` | every 10 min | `silver.refresh_scrape_context()` then `dash.refresh_context()`: run logs, shelf reads, serviceability, listings into silver; `dash.coverage` + `dash.collection_health`. Each part isolated; result in `ops.etl_run` (`brand_key = '_context'`) |
+| `sidnl-fp-ads` | every 10 min (+ on every upload, trigger) | `silver.load_fp_ads()` then `dash.refresh_ads()`: first-party ads exports -> silver -> `dash.ads`, `ads_campaign_period`, `ads_keyword_sov`, columns from the formula sheet |
 | `sidnl-alerts` | every minute | `silver.deliver_alerts()`: sends queued alerts to Slack (off until you add the webhook and switch it on) |
 
 ## Where to look
@@ -74,6 +75,8 @@ select * from ops.cron_alert_log order by alert_id desc limit 20;   -- every ale
 select * from dash.v_brand_scorecard_latest where brand_key = 'amul';  -- a brand's market position
 select * from silver.selftest() where not ok;  -- the self-test suite (35 tests); no rows = all pass
 select * from dash.collection_health order by obs_date desc;  -- scrape runs ok / partial / failed per day
+select * from silver.check_fp_ads() where not ok;   -- first-party ads feed: bronze -> silver -> dash proofs; no rows = all pass
+select * from dash.ads where report_level = 'campaign' order by obs_date;  -- ads per campaign-day (formula sheet: silver.ref_metric_support)
 select * from dash.coverage order by obs_date desc;  -- serviceable points per platform x city
 ```
 

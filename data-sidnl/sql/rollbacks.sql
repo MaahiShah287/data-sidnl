@@ -1240,3 +1240,158 @@ alter function silver.map_stock_status(text) set search_path to 'silver', 'ops',
 alter function silver.read_flags(text, boolean, boolean) set search_path to 'silver', 'pg_temp';
 alter function silver.read_stock_status(text, text, boolean, boolean) set search_path to 'silver', 'pg_temp';
 alter function silver.safe_int(text) set search_path to 'silver', 'pg_temp';
+
+-- ==================================================================== 20261111104030 dash_012_ads_from_formula_sheet
+-- UNDO THIS ONE FIRST (newer). Restores dash.ads to its pre-012 shape and the pre-012 dash.refresh_ads /
+-- dash.v_sov_keyword. silver_074 must still be in place while this runs. The catalog rows ad_spend / kw_vol keep
+-- their dash_012 text (their earlier text was not kept).
+select cron.unschedule('sidnl-fp-ads');
+drop trigger if exists fp_ads_refresh on public.fp_blinkit_ads;
+drop function if exists silver.on_fp_ads_change();
+drop function if exists silver.check_fp_ads();
+delete from dash.metric_catalog where metric_key in ('ads_roas', 'ads_sales_atc_units', 'ads_impressions_cpm',
+                                                     'ads_budget_claimables', 'sponsored_sov', 'ads_clicks_ctr_cpc_aov');
+drop view if exists dash.v_sov_keyword;
+drop table if exists dash.ads_keyword_sov;
+drop table if exists dash.ads_campaign_period;
+delete from dash.refresh_table_state where table_name in ('ads_campaign_period', 'ads_keyword_sov');
+delete from dash.ads;
+drop index if exists dash.ads_key;
+alter table dash.ads drop column if exists report_level;
+alter table dash.ads drop column if exists placement, drop column if exists subcampaign_id, drop column if exists match_type,
+                     drop column if exists pacing_type, drop column if exists cpm_bid;
+alter table dash.ads add column report_level text generated always as (
+    case when keyword is not null then 'keyword' when sidnl_id is not null then 'sku' else 'campaign' end) stored;
+create unique index ads_key on dash.ads (obs_date, platform, campaign_id, keyword, sidnl_id) nulls not distinct;
+create view dash.v_sov_keyword as
+select period_start, period_end, target_value as keyword, searches, sov_pct, loaded_at
+  from silver.fact_fp_ads where report_type = 'sov_period' and dq_status = 'valid'
+ order by period_end desc, sov_pct desc;
+drop function if exists dash.refresh_formula_table(text);
+-- pre-012 dash.refresh_ads (it double-counted recommendation days loaded from two files; restore only to undo)
+CREATE OR REPLACE FUNCTION dash.refresh_ads()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SET search_path TO 'dash', 'silver', 'pg_temp'
+AS $function$
+declare
+  v_rows bigint;
+  v_t0   timestamptz := clock_timestamp();
+begin
+  delete from dash.ads;
+  insert into dash.ads(obs_date, platform, campaign_id, keyword, sidnl_id,
+    campaign_name, campaign_type, campaign_budget, ad_spend, impressions,
+    direct_sales, indirect_sales, attributed_sales,
+    direct_roas, total_roas, new_users_acquired,
+    direct_atc, indirect_atc, atc,
+    direct_qty_sold, indirect_qty_sold, total_qty_sold, most_viewed_position, cpm)
+  select obs_date, 'blinkit', campaign_id, target_value, null,
+    max(campaign_name), max(ad_type), max(total_budget), max(budget_consumed), max(impressions),
+    max(direct_sales), max(indirect_sales), max(direct_sales) + max(indirect_sales),
+    max(direct_roas), max(total_roas), max(new_users),
+    max(direct_atc), max(indirect_atc), max(direct_atc) + max(indirect_atc),
+    max(direct_qty), max(indirect_qty), max(direct_qty) + max(indirect_qty),
+    max(most_viewed_position), max(cpm)
+  from silver.fact_fp_ads
+  where report_type = 'keyword_daily' and dq_status = 'valid'
+  group by obs_date, campaign_id, target_value
+  on conflict do nothing;
+  insert into dash.ads(obs_date, platform, campaign_id, keyword, sidnl_id,
+    campaign_name, campaign_type, campaign_budget, ad_spend, impressions,
+    direct_sales, indirect_sales, attributed_sales,
+    direct_roas, total_roas, new_users_acquired,
+    direct_atc, indirect_atc, atc,
+    direct_qty_sold, indirect_qty_sold, total_qty_sold, cpm)
+  select obs_date, 'blinkit', campaign_id, null, null,
+    max(campaign_name), 'Recommendation Ads', max(total_budget),
+    sum(budget_consumed), sum(impressions),
+    sum(direct_sales), sum(indirect_sales), sum(direct_sales) + sum(indirect_sales),
+    case when sum(budget_consumed) > 0 then sum(direct_sales)/sum(budget_consumed) end,
+    case when sum(budget_consumed) > 0
+         then (sum(direct_sales)+sum(indirect_sales))/sum(budget_consumed) end,
+    sum(new_users),
+    sum(direct_atc), sum(indirect_atc), sum(direct_atc) + sum(indirect_atc),
+    sum(direct_qty), sum(indirect_qty), sum(direct_qty) + sum(indirect_qty),
+    max(cpm)
+  from silver.fact_fp_ads
+  where report_type = 'reco_daily' and dq_status = 'valid'
+  group by obs_date, campaign_id
+  on conflict do nothing;
+  insert into dash.ads(obs_date, platform, campaign_id, keyword, sidnl_id,
+    campaign_name, campaign_type, campaign_budget, impressions)
+  select (select max(obs_date) from silver.fact_fp_ads where obs_date is not null),
+         'blinkit', campaign_id, null, null,
+    max(campaign_name), max(ad_type), max(total_budget), max(impressions)
+  from silver.fact_fp_ads
+  where report_type = 'mtd_claimables' and dq_status = 'valid'
+  group by campaign_id
+  on conflict do nothing;
+  get diagnostics v_rows = row_count;
+  insert into dash.refresh_table_state(table_name, last_refreshed_at, row_count, last_attempt_at, last_status)
+  values ('ads', now(), (select count(*) from dash.ads), now(), 'success')
+  on conflict (table_name) do update
+    set last_refreshed_at = now(), row_count = (select count(*) from dash.ads),
+        last_attempt_at = now(), last_status = 'success', last_error = null;
+  return jsonb_build_object('status','success','rows', (select count(*) from dash.ads),
+                            'ms', round(extract(epoch from clock_timestamp()-v_t0)*1000));
+exception when others then
+  insert into dash.refresh_table_state(table_name, last_attempt_at, last_status, last_error)
+  values ('ads', now(), 'failed', sqlerrm)
+  on conflict (table_name) do update
+    set last_attempt_at = now(), last_status = 'failed', last_error = sqlerrm;
+  return jsonb_build_object('status','failed','error', sqlerrm);
+end $function$;
+
+-- ==================================================================== 20261111103933 silver_074_fp_ads_formula_sheet
+-- Undo after dash_012. Restores the insert-only loader that existed before (created outside the migration system),
+-- removes the formula-sheet columns/rows, the grain table, the placement map and the silver views.
+delete from silver.ref_metric_support where dash_table is not null and metric not in ('Ad spend', 'KW VOL (Monthly)');
+update silver.ref_metric_support set support = 'not_available', silver_source = null, notes = 'No retail-media spend feed.'
+ where pdf_section = 8 and metric = 'Ad spend';
+update silver.ref_metric_support set support = 'not_available', silver_source = null,
+       notes = 'Source metric from retail-media platform; not scraped.'
+ where pdf_section = 8 and metric = 'KW VOL (Monthly)';
+drop index if exists silver.ref_metric_support_dash_column;
+alter table silver.ref_metric_support drop column if exists dash_table, drop column if exists dash_column,
+                                      drop column if exists sql_expr, drop column if exists grain_levels;
+drop table if exists silver.ref_dash_grain;
+drop view if exists silver.v_fp_ads_keyword_period;
+drop view if exists silver.v_fp_ads_campaign_period;
+drop view if exists silver.v_fp_ads_keyword_daily;
+drop view if exists silver.v_fp_ads_daily;
+drop table if exists silver.ref_ad_placement;
+CREATE OR REPLACE FUNCTION silver.load_fp_ads()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SET search_path TO 'silver', 'public', 'pg_temp'
+AS $function$
+declare
+  v_rows bigint;
+begin
+  insert into silver.fact_fp_ads(fp_ads_id, report_type, obs_date, period_start, period_end,
+    campaign_id, campaign_name, subcampaign_id, ad_type, target_type, target_value,
+    match_type, most_viewed_position, cpm, total_budget, impressions,
+    direct_atc, indirect_atc, new_users, direct_sales, indirect_sales,
+    direct_qty, indirect_qty, budget_consumed, direct_roas, total_roas,
+    searches, sov_pct, claimables, served_budget, loaded_at)
+  select id, report_type, obs_date, period_start, period_end,
+    campaign_id, campaign_name, subcampaign_id, ad_type, target_type, target_value,
+    match_type, most_viewed_position, cpm, total_budget, impressions,
+    direct_atc, indirect_atc, new_users, direct_sales, indirect_sales,
+    direct_qty, indirect_qty, budget_consumed, direct_roas, total_roas,
+    searches, sov_pct, claimables, served_budget, loaded_at
+  from public.fp_blinkit_ads b
+  where not exists (select 1 from silver.fact_fp_ads s where s.fp_ads_id = b.id)
+  on conflict (fp_ads_id) do nothing;
+  get diagnostics v_rows = row_count;
+  update silver.fact_fp_ads
+     set dq_status = 'suspect'
+   where dq_status = 'valid'
+     and (direct_sales < 0 or indirect_sales < 0 or budget_consumed < 0
+          or direct_roas < 0 or total_roas < 0);
+  return jsonb_build_object('status','ok','new_silver_rows', v_rows,
+                            'total', (select count(*) from silver.fact_fp_ads));
+end $function$;
+alter table silver.fact_fp_ads drop column if exists platform, drop column if exists source_file,
+                               drop column if exists pacing_type, drop column if exists placement,
+                               drop column if exists dq_flags;

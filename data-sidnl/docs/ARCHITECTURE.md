@@ -101,7 +101,10 @@ bronze scrape snapshots (`ops.store_city_filled`); stores whose snapshots name t
 | `availability` | date × platform × city × SKU × store (`store_key` NULL = city total) | OSA %, listing %, stock-outs, inventory, DOI, dark-store map |
 | `pricing` | date × platform × city × SKU | SP, MRP, discount, price/100 g, parity vs reference platform (blinkit), changes |
 | `visibility` | date × platform × city × search type × term × SKU | impressions, share of voice, top-of-search, ranks |
-| `overview`, `ads`, `supply` | defined, **empty**: need sales, retail-media and ERP/EDI feeds that do not exist yet | — |
+| `ads` | date × platform × campaign × keyword / placement (`report_level` keyword, placement, campaign) | ad spend, impressions, effective + bid CPM, direct/indirect/attributed sales, ROAS, ATC, units, new users, daily budget utilisation, keyword search volume (section 5a) |
+| `ads_campaign_period` | report period × platform × campaign | MTD total budget, claimables, utilisation, proof that claimables = daily spend |
+| `ads_keyword_sov` | report period × platform × keyword | searches, sponsored SoV %, own keyword-ad spend / sales / ROAS in the period |
+| `overview`, `supply` | defined, **empty**: need sales and ERP/EDI feeds that do not exist yet | — |
 | `dim_*` | copies of silver dimensions for the app | names |
 
 Rules: product = `sidnl_id`; each metric stored once; **every % has its numerator and denominator** (roll up as
@@ -114,6 +117,35 @@ checks) for Mr Munchies only.
 
 Why dash has ~100k rows from ~7k products: one row per product **per day, city and store where it was seen**
 (e.g. availability store rows = 945 stores × 7 days × ~10.5 client SKUs per store-day).
+
+## 5a. First-party ads feed: dash built from the formula sheet (`silver_074`, `dash_012`)
+```
+public.fp_blinkit_ads (bronze: Blinkit ad-console exports; public.fp_load_file = one row per uploaded file, sha256)
+   │  silver.load_fp_ads()   upsert every bronze row, delete vanished ones, map placements, MTD period from file name, dq
+   ▼
+silver.fact_fp_ads  ──►  v_fp_ads_daily (one row per day key: two files with the same day count once)
+                         v_fp_ads_keyword_daily, v_fp_ads_campaign_period, v_fp_ads_keyword_period
+   │  dash.refresh_ads() -> dash.refresh_formula_table(t) for ads, ads_campaign_period, ads_keyword_sov
+   │     rows    = silver.ref_dash_grain     (grain, source view, key columns)
+   │     columns = silver.ref_metric_support (dash_table, dash_column, sql_expr, grain_levels) = the formula sheet
+   ▼
+dash.ads / dash.ads_campaign_period / dash.ads_keyword_sov
+```
+- **One formula-sheet row per dash column.** Changing a formula = `update silver.ref_metric_support set sql_expr = ...`;
+  the next refresh uses it. A new metric = a new row (+ the dash column). `sql_expr` is an aggregate over the grain's
+  view (alias `f`); ratios are ratios of sums (`sum(direct_sales)/sum(spend)`), so keyword, placement and campaign
+  rows all roll up correctly. `sql_expr` NULL = the exports do not have it (clicks, CTR, CPC, AOV, conversion, reach,
+  keyword rank, campaign status, SI id): the column stays NULL, never 0.
+- **Runs on its own.** A statement trigger on `public.fp_blinkit_ads` reloads silver and dash right after an upload;
+  cron `sidnl-fp-ads` re-runs both every 10 min (formula edits). A failed refresh keeps the previous dash rows and shows
+  in `dash.v_refresh_status`.
+- **Proof.** `select * from silver.check_fp_ads();` — bronze = silver, duplicate files agree, dash = silver at every
+  grain, ROAS = the platform's RoAS, MTD claimables = sum of daily spend, every dash column is in the formula sheet.
+  On 2026-11-11 all 9 checks pass, and all 145 daily rows equal the Excel exports value for value.
+- **Not possible from these files:** joining ads to SI ids (no product in the exports), clicks-based metrics.
+- Front end / API: read `dash.ads` filtered on one `report_level` (never add levels together), plus the two period
+  tables. Example: `select obs_date, sum(ad_spend), sum(attributed_sales), round(sum(attributed_sales)/nullif(sum(ad_spend),0),2)
+  from dash.ads where report_level = 'campaign' group by 1 order by 1;`
 
 ## 6. Proof that dash = bronze (`silver_061`, `silver_063`)
 `silver.reconcile()` (daily) compares every reading and every shelf fact with its bronze row (price, MRP, inventory,
