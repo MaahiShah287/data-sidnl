@@ -167,6 +167,222 @@ Keyword detail = §3, placement detail = §5 without `group by`, campaign summar
 
 ---
 
+---
+
+# Part 2 — one query per metric button
+
+Each metric on the frontend has its own button/tile. Clicking it runs **one** query that
+returns both the headline number (total over the date range) and the daily trend, using
+`grouping sets ((obs_date), ())`: the row with `obs_date = null` is the headline KPI, the
+other rows are the chart series. Same pattern for every metric — only the metric
+expression changes.
+
+Shared where-clause for every query in this part:
+
+```sql
+where platform = :platform
+  and obs_date between :date_from and :date_to
+  and report_level = 'keyword'
+```
+
+(shown as `... shared where ...` below; the Backend should paste the full where-clause.)
+
+## M1 — Ad Spend (`ad_spend`)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       sum(ad_spend) as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M2 — Impressions (`impressions`)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       sum(impressions) as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M3 — Attributed Sales (`attributed_sales` = direct + indirect)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       sum(attributed_sales) as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M4 — Direct Sales
+
+```sql
+... sum(direct_sales) as value
+```
+
+## M5 — Indirect Sales
+
+```sql
+... sum(indirect_sales) as value
+```
+
+## M6 — Direct RoAS (recomputed from sums, never averaged)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       case when sum(ad_spend) > 0
+            then sum(direct_sales) / sum(ad_spend) end as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M7 — Total RoAS (recomputed)
+
+Same as M6 with `sum(attributed_sales) / sum(ad_spend)`.
+
+## M8 — New Users Acquired (`new_users_acquired`)
+
+```sql
+... sum(new_users_acquired) as value
+```
+
+## M9 — Add-to-Cart: total / direct / indirect (3 buttons, one pattern)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       sum(atc)         as total_atc,
+       sum(direct_atc)  as direct_atc,
+       sum(indirect_atc) as indirect_atc
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M10 — Quantity Sold: total / direct / indirect (3 buttons)
+
+```sql
+... sum(total_qty_sold)     as total_qty,
+    sum(direct_qty_sold)    as direct_qty,
+    sum(indirect_qty_sold)  as indirect_qty
+```
+
+## M11 — CPM (weighted: total spend ÷ total impressions × 1000)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       case when sum(impressions) > 0
+            then sum(ad_spend) / sum(impressions) * 1000 end as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M12 — Most Viewed Position (best rank achieved; lower = better)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       min(most_viewed_position) as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## M13 — Budget Utilisation (spend ÷ campaign budget)
+
+`budget_utilisation_pct` is null in current data (portal gives `Total Budget` and
+`Estimated Budget Consumed`; utilisation is computed). Summing budgets across keywords
+double-counts the shared campaign budget, so compute per campaign:
+
+```sql
+select campaign_id, campaign_name,
+       max(campaign_budget) as budget,
+       sum(ad_spend)        as spend,
+       case when max(campaign_budget) > 0
+            then sum(ad_spend) / max(campaign_budget) * 100
+       end as utilisation_pct
+from dash.ads
+where ... shared where ...
+group by campaign_id, campaign_name
+order by utilisation_pct desc nulls last;
+```
+
+## M14 — SoV Searches (button on the SoV card)
+
+```sql
+select keyword, searches, sov_pct, period_start, period_end
+from dash.v_sov_keyword
+where (:keyword is null or keyword = :keyword)
+order by period_end desc, searches desc;
+```
+
+## M15 — SoV % (button on the SoV card)
+
+Same query as M14 — the card renders `sov_pct` (0–100) instead of `searches`.
+
+## M16 — Conversion Rate (`conversion_rate_pct` = qty ÷ ATC)
+
+```sql
+select obs_date,
+       case when grouping(obs_date) = 1 then 'TOTAL' else 'DAY' end as row_kind,
+       case when sum(atc) > 0
+            then sum(total_qty_sold)::numeric / sum(atc) * 100 end as value
+from dash.ads
+where ... shared where ...
+group by grouping sets ((obs_date), ())
+order by grouping(obs_date), obs_date;
+```
+
+## Buttons with NO data yet (return all-null — do not hide, show "no data")
+
+The columns exist in `dash.ads` but the portals don't export these yet:
+
+| Button | Column | Query |
+|---|---|---|
+| Clicks | `clicks` | `select obs_date, sum(clicks) ...` (same pattern as M2) |
+| CTR % | `ctr_pct` | `sum(clicks)/nullif(sum(impressions),0)*100` |
+| CPC | `cpc` | `sum(ad_spend)/nullif(sum(clicks),0)` |
+| Reach | `reach` | `max(reach)` per day (dedup metric) |
+| AOV | `aov` | `sum(attributed_sales)/nullif(sum(total_qty_sold),0)` |
+| Keyword Rank | `keyword_rank` | `min(keyword_rank)` |
+| Keyword Volume | `kw_volume_monthly` | `max(kw_volume_monthly)` |
+
+## Drill-down template (any metric tile → keyword breakdown)
+
+When a metric button opens a per-keyword breakdown, reuse that metric's expression with a
+keyword group-by:
+
+```sql
+select keyword,
+       <metric expression from M1..M16> as value,
+       count(distinct obs_date)         as days_active
+from dash.ads
+where ... shared where ...
+group by keyword
+order by value desc nulls last;
+```
+
+And per-campaign breakdown: same with `group by campaign_id, campaign_name`.
+
+---
+
 ## Query-contract rules for Backend (summary)
 
 1. Read only `dash.ads`, `dash.ads_campaign_period`, `dash.ads_keyword_sov` (and `dash.v_refresh_status`).
