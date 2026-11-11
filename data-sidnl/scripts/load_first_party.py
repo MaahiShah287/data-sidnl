@@ -211,6 +211,25 @@ def parse_file(path: Path) -> list[dict]:
     raise ValueError(f"no parser for {path.name} — add one to PARSERS")
 
 
+def load_env_file() -> None:
+    """Read KEY=VALUE pairs from repo-root .env (if present) into os.environ.
+    Existing environment variables win. .env is git-ignored and never printed."""
+    env_path = PROJECT_ROOT.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file()
+
+
 def main():
     args = sys.argv[1:]
     files = [Path(a) for a in args] if args else \
@@ -221,8 +240,9 @@ def main():
 
     dsn = os.environ.get("SUPABASE_DB_URL", "")
     if not dsn:
-        print("ERROR: SUPABASE_DB_URL not set "
-              "(Supabase > Connect > Session pooler; never commit it)")
+        print("ERROR: SUPABASE_DB_URL not set.\n"
+              "Create .env in the repo root (copy .env.example) or set the\n"
+              "SUPABASE_DB_URL environment variable. Never commit .env.")
         sys.exit(1)
 
     with psycopg.connect(dsn, connect_timeout=15) as conn:
