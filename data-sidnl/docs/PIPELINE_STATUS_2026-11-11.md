@@ -3,7 +3,7 @@
 Today's work: bring silver in line with *Bronze → Silver: which columns to carry* (10 Nov), cut the silver
 self-tests down to a lean suite, and harden fallbacks, data quality and performance.
 
-**Status: applied to production on 2026-11-11 06:36–06:40 UTC** (`silver_069`, `silver_070`, `dash_011`, `silver_071`, `silver_072`; each md5 equals its file in `sql/migrations/`). Backfill done (99,251 shelf rows, 48,879 readings, 4,777 scans); self-test 35/35; `sidnl-context` ran on its own at 06:40 (2.6 s, 9/9 sections). Before applying, all five were executed against production (Supabase, at `silver_068`) inside transactions that were rolled back. Afterwards the
+**Status: applied to production on 2026-11-11 06:36–06:40 UTC** (`silver_069`, `silver_070`, `dash_011`, `silver_071`, `silver_072`, then `silver_073` at 07:03; each md5 equals its file in `sql/migrations/`). Backfill done (99,251 shelf rows, 48,879 readings, 4,777 scans); self-test 35/35; `sidnl-context` ran on its own at 06:40 (2.6 s, 9/9 sections). Before applying, all five were executed against production (Supabase, at `silver_068`) inside transactions that were rolled back. Afterwards the
 database was confirmed unchanged: same latest migration, no new objects, `refresh_brand` byte-identical. The real
 code ran on real rows (loaders, backfill, context load, dash refresh, self-test, gate).
 
@@ -24,7 +24,7 @@ quality functions (`reading_dq`, `dq_status`, `map_stock_status` and today's `re
 `safe_int`) carry `SET search_path`, which stops PostgreSQL from inlining them, so every one of 2.09 M rows pays several
 full function calls (`reading_dq` alone: 34 s over the table). Fix written as `sql/pending/silver_073_inline_row_functions.sql`
 (drops the clause; they only call built-ins). Measured in a rolled-back test: **4.51 s → 1.49 s per 100,000 rows**,
-about a minute off every full reload. Not applied yet.
+about a minute off every full reload. **Applied 07:03 UTC** (md5 matches, self-test 35/35); measured after: 1.56 s per 100,000 rows. `reading_dq` alone only improves 34.3 s -> 28.6 s over the table: PostgreSQL still won't fully inline it because it uses each argument several times; rewriting it is a later step.
 
 ## 0. Dry-run results (2026-11-11, measured)
 

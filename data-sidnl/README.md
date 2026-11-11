@@ -23,7 +23,7 @@ ops     run history, quality results, alerts, checks       (ops.*)
 | `sql/03_views_jobs_config.sql` | views, grants, configuration rows, the pg_cron jobs |
 | `sql/rollbacks.sql` | the rollback for each migration since `silver_041` (undo newest first) |
 | `sql/manifest.csv` | every applied migration: version, name, md5 of the applied SQL |
-| `sql/migrations/` | exact SQL of the migrations applied since 2026-11-11 (`silver_069`–`072`, `dash_011`); md5 in `manifest.csv`, checked by the tests. Status report: [docs/PIPELINE_STATUS_2026-11-11.md](docs/PIPELINE_STATUS_2026-11-11.md) |
+| `sql/migrations/` | exact SQL of the migrations applied since 2026-11-11 (`silver_069`–`073`, `dash_011`); md5 in `manifest.csv`, checked by the tests. Status report: [docs/PIPELINE_STATUS_2026-11-11.md](docs/PIPELINE_STATUS_2026-11-11.md) |
 | `sql/pending/` | migrations written but not yet applied (apply order in `ORDER`); empty today |
 | `sidnl.py` | command line (below) |
 | `tests/test_live_db.py` | tests against the live database (skipped without `SUPABASE_DB_URL`) |

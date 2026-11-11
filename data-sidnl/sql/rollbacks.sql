@@ -1232,3 +1232,11 @@ $function$
 drop index if exists silver.ix_fsp_unlinked;
 drop index if exists silver.ix_fsp_no_store;
 delete from silver.sidnl_config where key = 'dq_gate_window';
+
+-- ==================================================================== 20261111070331 silver_073_inline_row_functions
+alter function silver.reading_dq(boolean, boolean, timestamptz, text, integer, numeric, numeric) set search_path to 'silver', 'ops', 'public', 'pg_temp';
+alter function silver.dq_status(text[]) set search_path to 'silver', 'ops', 'public', 'pg_temp';
+alter function silver.map_stock_status(text) set search_path to 'silver', 'ops', 'public', 'pg_temp';
+alter function silver.read_flags(text, boolean, boolean) set search_path to 'silver', 'pg_temp';
+alter function silver.read_stock_status(text, text, boolean, boolean) set search_path to 'silver', 'pg_temp';
+alter function silver.safe_int(text) set search_path to 'silver', 'pg_temp';
