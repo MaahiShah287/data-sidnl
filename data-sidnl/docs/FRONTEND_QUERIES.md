@@ -1,185 +1,183 @@
 # SIDNL Frontend Button → SQL Query Map (first-party ads)
 
-Nov 11, 2026 · For the Backend/FastAPI team.
+Nov 11, 2026 · For the Backend/FastAPI team. Updated for `silver_074` / `dash_012` (dash built from the formula sheet).
 
-Every query below is **read-only** and hits only the two frontend-facing objects:
+Every query below is **read-only** and hits only these frontend-facing objects:
 
 | Object | Grain | Rows today |
 |---|---|---|
-| `dash.ads` | one row per date × platform × campaign × keyword (keyword rows) or per date × campaign (campaign rows) | 95 |
-| `dash.v_sov_keyword` | one row per keyword per period | 2 |
+| `dash.ads` | one row per date × platform × campaign × (keyword \| placement), plus one rollup row per date × campaign | 183 |
+| `dash.ads_campaign_period` | one row per campaign × MTD report period (budget, claimables) | 2 |
+| `dash.ads_keyword_sov` | one row per keyword × sponsored-SoV report period | 2 |
+| `dash.v_sov_keyword` | same as `ads_keyword_sov` (old column names, kept for existing callers) | 2 |
 
-All other `fp_*` / silver objects are internal pipeline plumbing — never query them from the API.
+All `fp_*` / silver objects are internal pipeline plumbing — never query them from the API.
 
-**Golden rule for every query:** always include `report_level` in `where`/`group by`.
-`report_level = 'keyword'` = daily keyword rows; `'campaign'` = daily reco summaries and the
-MTD campaign summary. Mixing them double-counts spend and impressions.
+**Golden rule: filter one `report_level` per query.**
 
-Placeholders: `:date_from`, `:date_to` (dates), `:platform` (`'blinkit'`), `:campaign_id`,
-`:keyword`. All are optional filters unless noted.
+| `report_level` | What it is | Rows today |
+|---|---|---|
+| `'campaign'` | one campaign on one day = all its keyword or placement rows added up, + daily budget and budget utilisation. **Use for every total, KPI card and trend.** | 38 |
+| `'keyword'` | keyword ads (Product Booster): one keyword of a campaign on one day | 75 |
+| `'placement'` | recommendation ads: one placement (Next Product / Similar Product / Repeat Order …) on one day | 70 |
+
+`'keyword'` + `'placement'` together = `'campaign'`. Adding `'campaign'` to either double-counts.
+
+Placeholders: `:date_from`, `:date_to` (dates), `:platform` (`'blinkit'`), `:campaign_id`, `:keyword`.
 
 ---
 
 ## 1. Ads Overview page — headline KPI cards
 
-**Button/page:** Ads → Overview (spend, attributed sales, RoAS, impressions for a date range)
-
 ```sql
-select
-    sum(ad_spend)                                        as total_spend,
-    sum(attributed_sales)                                as attributed_sales,
-    case when sum(ad_spend) > 0
-         then sum(attributed_sales) / sum(ad_spend) end  as blended_roas,
-    sum(impressions)                                     as impressions,
-    sum(new_users_acquired)                              as new_users
+select sum(ad_spend)                                                  as total_spend,
+       sum(attributed_sales)                                          as attributed_sales,
+       round(sum(attributed_sales) / nullif(sum(ad_spend), 0), 2)     as total_roas,
+       round(sum(direct_sales) / nullif(sum(ad_spend), 0), 2)         as direct_roas,
+       sum(impressions)                                               as impressions,
+       round(sum(ad_spend) * 1000 / nullif(sum(impressions), 0), 2)   as effective_cpm,
+       sum(atc)                                                       as add_to_carts,
+       sum(total_qty_sold)                                            as units_sold,
+       sum(new_users_acquired)                                        as new_users
 from dash.ads
 where platform = :platform
   and obs_date between :date_from and :date_to
-  and report_level = 'keyword';        -- daily keyword rows only, no MTD summary
+  and report_level = 'campaign';
 ```
+Expected for 2026-10-01 → 2026-10-19: spend 23,255.30 · attributed sales 53,460.00 · total RoAS 2.30 ·
+impressions 96,851 (= the MTD Claimables sheet: 7,193.10 + 16,062.20 spend, 16,540 + 80,311 impressions).
 
 ## 2. Ads trend chart — daily series
 
-**Button/page:** Ads → trend line (spend & RoAS per day)
-
 ```sql
 select obs_date,
-       sum(ad_spend)         as spend,
-       sum(attributed_sales) as attributed_sales,
-       case when sum(ad_spend) > 0
-            then sum(attributed_sales) / sum(ad_spend) end as roas
+       sum(ad_spend)                                              as spend,
+       sum(attributed_sales)                                      as attributed_sales,
+       round(sum(attributed_sales) / nullif(sum(ad_spend), 0), 2) as roas
 from dash.ads
-where platform = :platform
-  and obs_date between :date_from and :date_to
-  and report_level = 'keyword'
+where platform = :platform and obs_date between :date_from and :date_to
+  and report_level = 'campaign'
 group by obs_date
 order by obs_date;
 ```
 
-## 3. Keyword table — per-keyword performance
-
-**Button/page:** Ads → Keywords tab (sortable table: keyword, spend, RoAS, sales, position)
+## 3. Keyword table — per-keyword, per-day
 
 ```sql
-select obs_date, campaign_id, campaign_name, keyword, match_type,
-       ad_spend, impressions, most_viewed_position,
-       direct_sales, indirect_sales, attributed_sales,
-       direct_roas, total_roas,
-       direct_atc, indirect_atc, atc,
-       new_users_acquired, direct_qty_sold, indirect_qty_sold, total_qty_sold
+select obs_date, campaign_id, campaign_name, keyword, match_type, cpm_bid, cpm,
+       ad_spend, impressions, most_viewed_position, kw_volume_monthly,
+       direct_sales, indirect_sales, attributed_sales, direct_roas, total_roas,
+       direct_atc, indirect_atc, atc, new_users_acquired,
+       direct_qty_sold, indirect_qty_sold, total_qty_sold
 from dash.ads
-where platform = :platform
-  and obs_date between :date_from and :date_to
+where platform = :platform and obs_date between :date_from and :date_to
   and report_level = 'keyword'
   and (:keyword is null or keyword = :keyword)
 order by obs_date desc, total_roas desc nulls last;
 ```
+`cpm` = effective CPM (spend ÷ impressions × 1000); `cpm_bid` = the CPM set on the keyword.
+`kw_volume_monthly` = searches in the SoV report period: an attribute, **never sum it across days**.
 
-## 4. Keyword leaderboard — aggregated over the range
-
-**Button/page:** Ads → "Top keywords" card
+## 4. Keyword leaderboard — over the range
 
 ```sql
 select keyword,
-       sum(ad_spend)        as spend,
-       sum(attributed_sales) as attributed_sales,
-       sum(impressions)     as impressions,
-       case when sum(ad_spend) > 0
-            then sum(attributed_sales) / sum(ad_spend) end as roas,
-       max(most_viewed_position) as best_position,
-       count(distinct obs_date)  as days_active
+       sum(ad_spend)                                              as spend,
+       sum(attributed_sales)                                      as attributed_sales,
+       sum(impressions)                                           as impressions,
+       round(sum(attributed_sales) / nullif(sum(ad_spend), 0), 2) as roas,
+       min(most_viewed_position)                                  as best_position,
+       max(kw_volume_monthly)                                     as searches_in_period,
+       count(distinct obs_date)                                   as days_active
 from dash.ads
-where platform = :platform
-  and obs_date between :date_from and :date_to
+where platform = :platform and obs_date between :date_from and :date_to
   and report_level = 'keyword'
 group by keyword
 order by roas desc nulls last;
 ```
 
-## 5. Campaign drill-down
-
-**Button/page:** click a campaign card / filter by campaign
+## 5. Recommendation placements
 
 ```sql
--- daily series for one campaign (keyword rows)
-select obs_date, keyword, ad_spend, impressions, attributed_sales,
-       direct_roas, total_roas, most_viewed_position
+select placement,
+       sum(ad_spend)                                              as spend,
+       sum(impressions)                                           as impressions,
+       sum(attributed_sales)                                      as attributed_sales,
+       round(sum(attributed_sales) / nullif(sum(ad_spend), 0), 2) as roas,
+       sum(new_users_acquired)                                    as new_users
 from dash.ads
-where platform = :platform
-  and campaign_id = :campaign_id
+where platform = :platform and obs_date between :date_from and :date_to
+  and report_level = 'placement'
+group by placement
+order by spend desc;
+```
+
+## 6. Campaign drill-down
+
+```sql
+-- one campaign per day, with daily budget and utilisation
+select obs_date, campaign_name, campaign_type, campaign_budget, budget_utilisation_pct,
+       ad_spend, impressions, attributed_sales, direct_roas, total_roas
+from dash.ads
+where platform = :platform and campaign_id = :campaign_id
   and obs_date between :date_from and :date_to
-  and report_level = 'keyword'
-order by obs_date desc;
-
--- campaign-level daily rollup (reco ads live only at this level)
-select obs_date, campaign_name, ad_spend, impressions, attributed_sales, total_roas
-from dash.ads
-where platform = :platform
-  and campaign_id = :campaign_id
   and report_level = 'campaign'
-  and keyword is null            -- excludes the MTD summary row
-  and obs_date between :date_from and :date_to
 order by obs_date desc;
 ```
+For the detail under it, use §3 (keyword campaigns) or §5 (recommendation campaigns) with `campaign_id = :campaign_id`.
 
-## 6. MTD campaign summary (budget & claimables context)
-
-**Button/page:** campaign card footer — "month-to-date" chip
+## 7. MTD campaign summary (budget & claimables)
 
 ```sql
--- MTD rows: report_level = 'campaign' with campaign_budget + impressions set,
--- landing on the latest known ads date. Identify by no spend attribution:
-select campaign_id, campaign_name, campaign_type, campaign_budget, impressions, obs_date
-from dash.ads
+select campaign_id, campaign_name, campaign_type, period_start, period_end,
+       total_budget, claimables, served_budget_consumed, budget_utilisation_pct, impressions,
+       daily_ad_spend, daily_days, spend_reconciled
+from dash.ads_campaign_period
 where platform = :platform
-  and report_level = 'campaign'
-  and ad_spend is null            -- MTD summary row marker
-order by campaign_id;
+order by period_end desc, campaign_id;
 ```
+Expected today (period 2026-10-01 → 2026-10-31): 284970 Chaap Aug 2025 — budget 95,000, claimables 7,193.10,
+7.57 % used; 330981 Recommendation — budget 47,500, claimables 16,062.20, 33.82 % used. `spend_reconciled = true`
+means the daily rows add up to the platform's month figure.
 
-## 7. Share of Voice card
-
-**Button/page:** Ads → SoV widget
+## 8. Share of Voice card
 
 ```sql
-select keyword, searches, sov_pct, period_start, period_end
-from dash.v_sov_keyword
-where (:keyword is null or keyword = :keyword)
-order by period_end desc, sov_pct desc;
+select keyword, period_start, period_end, searches, sponsored_sov_pct,
+       ad_impressions, ad_spend, attributed_sales, total_roas, ad_days
+from dash.ads_keyword_sov
+where platform = :platform and (:keyword is null or keyword = :keyword)
+order by period_end desc, sponsored_sov_pct desc;
 ```
+Expected today: `chaap` 10.23 % of 82,474 searches; `soya chaa` 71.10 % of 3,525 (2026-10-01 → 2026-11-01).
 
-Expected today: `chaap` → 10.23% of 82,474 searches; `soya chaa` → 71.1% of 3,525
-(period 2026-10-01 → 2026-11-01).
-
-## 8. Date-picker / freshness check
-
-**Button/page:** any page load — what date range has data?
+## 9. Date-picker / freshness
 
 ```sql
-select min(obs_date) as data_from, max(obs_date) as data_to,
-       count(*) as rows_loaded
-from dash.ads
-where platform = :platform;
+select min(obs_date) as data_from, max(obs_date) as data_to
+from dash.ads where platform = :platform and report_level = 'campaign';
+
+select table_name, last_refreshed_at, last_status, refresh_failing
+from dash.v_refresh_status where table_name like 'ads%';
 ```
 
-## 9. Export / CSV download
+## 10. Export / CSV
 
-**Button/page:** Ads → Export. Same query as §3 (keyword detail), no limit — Backend
-streams it as CSV. Do **not** include `report_level = 'campaign'` rows in the same export
-unless the UI has a separate "campaign summary" export, which uses §5's second query.
+Keyword detail = §3, placement detail = §5 without `group by`, campaign summary = §6. One `report_level` per file.
 
 ---
 
 ## Query-contract rules for Backend (summary)
 
-1. Read **only** `dash.ads` and `dash.v_sov_keyword`.
-2. Always filter `platform = 'blinkit'` (until Zepto lands) — the column exists and will
-   gain a second value later.
-3. Always handle `report_level`; daily metrics = `'keyword'` only.
+1. Read only `dash.ads`, `dash.ads_campaign_period`, `dash.ads_keyword_sov` (and `dash.v_refresh_status`).
+2. Always filter `platform` — it will gain values when other platforms' feeds land.
+3. One `report_level` per query; totals and trends use `'campaign'`.
 4. `obs_date` is the portal's IST reporting date; range-filter with `between` (inclusive).
-5. `null` means "not reported", never 0 — don't coalesce money to 0 in aggregates; use
-   `sum()` which ignores nulls.
-6. RoAS shown to users should be computed from summed sales ÷ summed spend (§1/§2/§4), not
-   averaged from per-row `direct_roas`.
-7. The tables refresh via `dash.refresh_ads()` (cron every 15 min, or after each Excel
-   load). There is no write path from the API — the app is read-only on these objects.
+5. `null` = "not in the source data", never 0. Columns that are always NULL today because the Blinkit exports do not
+   have them: `clicks`, `reach`, `ctr_pct`, `cpc`, `aov`, `conversion_rate_pct`, `keyword_rank`,
+   `keyword_opportunity`, `campaign_status`, `is_campaign_on`, `sidnl_id`. Hide those widgets rather than show 0.
+6. Ratios (RoAS, CPM, utilisation) shown for a range = summed numerator ÷ summed denominator, never an average of
+   per-row ratios.
+7. Every column is one metric in the formula sheet `silver.ref_metric_support` (`dash_table`, `dash_column`,
+   `sql_expr`); ask data engineering there for a definition. The tables refresh on every Excel upload (trigger)
+   and every 10 min (cron `sidnl-fp-ads`). The API never writes to them.
