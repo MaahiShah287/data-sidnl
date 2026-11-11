@@ -17,6 +17,7 @@ class ChatState(TypedDict, total=False):
     # Routing
     route: Route
     router_confidence: float          # 0–1 score from router
+    router_error: str | None          # set when the router LLM call failed
 
     # RAG path
     rewritten_query: str

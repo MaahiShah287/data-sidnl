@@ -81,3 +81,144 @@ python -m venv .venv
 - `Rag/src/graph/` — LangGraph router/RAG/SQL
 - `Rag/eval/`, `Rag/metrics/` — evaluation + metric dictionary
 - `data-sidnl/sql/` — silver/gold pipeline SQL (other part of the project)
+
+## Session log
+
+### 2026-11-10 — rebuild after the working tree was wiped
+
+**What happened (important for the next person):** the repo was re-cloned to
+the consolidated layout *over this working directory*. `git reflog` shows a
+single entry, `clone: from github.com/MaahiShah287/data-sidnl`; the Recycle Bin
+shows the previous root-level `docs/`, `sql/`, `COMMIT_INSTRUCTIONS.md` and
+`MANIFEST.csv` deleted. Consequences:
+
+- **All uncommitted `Rag/` work was lost** — the docs indexer, the metadata
+  fixes, the tests and the earlier session log. There was no stash and no
+  branch, so nothing was recoverable from git. Everything below was rebuilt
+  from scratch; treat it as new work, not as a re-run of finished work.
+- `Rag/.venv`, `Rag/chroma_db/` and `Rag/reports/` are absent (all ignored).
+- **The docs corpus was consolidated.** `4d2e51d` deleted 14 doc files
+  (`silver/SILVER_SCHEMA.md`, `silver/CANONICAL_MAP.md`,
+  `silver/SILVER_OPERATIONS.md`, `gold/GOLD_METRIC_VIEWS.md`,
+  `fallbacks-design.md`, the audits, the ERDs) and merged them into a single
+  `data-sidnl/docs/ARCHITECTURE.md` (155 lines, verified against the live DB).
+  The old files remain in git history (`git show 944ecf7:data-sidnl/docs/...`)
+  if ever needed. **`src/retrieval/docs_index.py` now globs `docs/**/*.md`
+  instead of hard-coding a list**, so the next consolidation does not silently
+  index nothing. Audit/report/ERD files are skipped by name.
+
+**Verified working this session:**
+
+- `.venv` rebuilt with Python 3.11.4, `pip install -e ".[dev]"` OK.
+- DB reachable through the read-only pool, all three views match the handoff:
+  `v_all_platforms` 56,249 / `v_latest_observation` 5,055 /
+  `v_latest_shelf_position` 33,991. A `DELETE` is rejected with
+  `SQLValidationError` — writes are blocked as designed.
+- Docs corpus on the consolidated repo: **16 metric + 16 documentation = 32
+  chunks** (metric dictionary + `ARCHITECTURE.md`).
+- Test suite: **62 passed** (50 safe-SQL + 12 docs-index).
+
+**Restored/added in this session** (all previously lost):
+
+1. `src/retrieval/docs_index.py` — metric + markdown chunking, append-only
+   ingest, metadata backfill (`source_view` → `source_file`, `doc_type`,
+   `section="rows a-b"`, keeping `source_view` for backward compatibility).
+2. `scripts/add_docs.py` — append docs to an existing collection without
+   re-embedding the row documents.
+3. `scripts/build_index.py` — row docs now also carry
+   `source_file`/`section`/`doc_type`, and a full rebuild ingests docs too.
+4. `src/graph/rag_graph.py` — `_source_file()` / `_section()` / `_citation()`
+   accept both metadata schemas, so citations no longer render as `unknown#`.
+5. `src/retrieval/hybrid.py` — the `SentenceTransformer` is cached per process
+   instead of being reloaded on every query.
+6. `src/config.py` + `.env.example` — `DOCS_DIR`; `.env.example` now documents
+   the IPv4 **pooler** DSN and the real `sidnl_chatbot_app` role.
+7. `scripts/run_ground_truth.py` — `parse_dsn()` now uses `urlsplit()`, so
+   passwords containing `@` or `:` no longer break the connection.
+8. `pyproject.toml` — added `httpx` (used by `eval/run_eval.py`); added the
+   missing `README.md` that `readme = "README.md"` requires.
+
+**Doc bug worth fixing in the data repo:** `docs/ARCHITECTURE.md` §8 says
+"`Rag/` queries `silver.demo`, which was dropped in `silver_054`". That is
+stale — all 22 references to `silver.demo` in `Rag/` are *defensive*: the SQL
+firewall, planner prompt, profiler and eval all blocklist or assert against it.
+No Rag query reads it.
+
+⚠️ **Chroma version risk:** the index is being rebuilt from scratch under the
+resolved Chroma (1.5.9), so the "0.5.x index may not open" risk no longer
+applies — but a copied index from an older machine would still hit it.
+
+#### Error 1 — bulk read hits the chatbot's statement timeout
+
+```
+Fetching silver.v_all_platforms ...
+psycopg.errors.QueryCanceled: canceling statement due to statement timeout
+  File "scripts/build_index.py", line 98, in collect_all_documents
+    cur.execute(f"SELECT * FROM {view}")
+```
+
+Cause: `db/client.py` sets `statement_timeout=10000` as a *connection option*
+for the whole pool, so `get_conn()` inherits 10 s. `SELECT *` over
+`v_all_platforms` (56,249 rows) needs longer. Do **not** raise the pool's cap —
+that is the chatbot's guard against runaway LLM-generated SQL.
+
+Fix: `db/client.py` gains `get_bulk_conn()`, a direct (non-pooled) connection
+that is still `default_transaction_read_only=on` but allows
+`statement_timeout=600000`; `build_index.py` uses it for ingestion only.
+
+#### Error 2 — the LLM account has no credits (BLOCKER for all LLM paths)
+
+Smoke test of the main graph, `"What is the in-stock rate for Mr Munchies on
+Zepto?"`, returned `route=AMBIGUOUS, confidence=0.0` in 7.9 s. That is the
+router's *fail-safe*, not a classification: `router_node` catches every
+exception and returns AMBIGUOUS with confidence 0.0, discarding the reason
+(it is never written to state), so the failure was invisible.
+
+Probing the provider directly:
+
+```
+OpenAIRateLimitError: Error code: 429 - You have no credits remaining.
+Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.
+```
+
+The key itself is fine (present, 164 chars) and `LLM_API_BASE` is the default
+`https://api.openai.com/v1`; the organization simply has a zero balance. This
+blocks **router, SQL planner, answer generation, RAG grading/verification and
+`eval/run_eval.py`**. Retrieval and the index build do not need the LLM.
+
+Options: add OpenAI credits, or switch to an OpenAI-compatible provider (the
+handoff already supports Groq: set `LLM_API_KEY=gsk_...`,
+`LLM_API_BASE=https://api.groq.com/openai/v1`, and matching model names).
+
+**Diagnostic gap worth fixing:** an infrastructure failure currently looks
+exactly like a real "this question is ambiguous" decision. `ChatState` now
+carries `router_error`, so scripts/eval can tell the two apart instead of
+silently scoring a 429 as a routing miss.
+
+#### Error 3 — prompts contain literal JSON, so `str.format()` raises KeyError
+
+After switching to Groq the router worked (routed NUMERIC), then the SQL path
+died before reaching the model:
+
+```
+KeyError: '"error"'
+  File "src/graph/sql_graph.py", line 99, in plan_query_node
+    prompt = _load_prompt("sql_planner.md").format(
+```
+
+Cause: the prompt files contain JSON examples. `str.format()` treats every
+`{...}` as a field, so `{"error": "<reason>"}` becomes a lookup of the key
+`"error"`. **Four prompts are affected**: `sql_planner.md`,
+`rag_grade_relevance.md`, `rag_rewrite.md`, `rag_verify_claims.md`.
+
+This is why neither path ever worked: `.format()` runs *before* the `try`
+block in every node, so SQL planning and RAG grading both raise before the
+LLM is called. It is invisible in unit tests because no test renders a prompt.
+
+Fix: new `src/graph/prompt_utils.py` with `render(template, **kwargs)`, which
+substitutes only `{lower_case_identifier}` placeholders and leaves JSON
+braces untouched. All six `.format()` call sites now use it.
+
+
+
+

@@ -21,6 +21,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from config import settings
+from graph.prompt_utils import render
 from graph.state import ChatState
 from retrieval.hybrid import retrieve
 
@@ -54,6 +55,20 @@ def _critic_json(model_key: str = "critic") -> ChatOpenAI:
     )
 
 
+def _source_file(meta: dict) -> str:
+    """Row docs carry source_view; documentation chunks carry source_file."""
+    return str(meta.get("source_file") or meta.get("source_view") or "unknown")
+
+
+def _section(meta: dict) -> str:
+    return str(meta.get("section") or "")
+
+
+def _citation(meta: dict) -> str:
+    section = _section(meta)
+    return f"{_source_file(meta)}#{section}" if section else _source_file(meta)
+
+
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
@@ -61,7 +76,9 @@ def _critic_json(model_key: str = "critic") -> ChatOpenAI:
 def retrieve_node(state: ChatState) -> ChatState:
     start = time.monotonic()
     query = state.get("rewritten_query") or state.get("question", "")
-    chunks = retrieve(query, top_k=settings.retrieval_top_k)
+    # DEFINITION questions are answered from documentation, not from data rows.
+    doc_types = ["metric", "documentation"] if state.get("route") == "DEFINITION" else None
+    chunks = retrieve(query, top_k=settings.retrieval_top_k, doc_types=doc_types)
     latency = round((time.monotonic() - start) * 1000, 1)
     trace = list(state.get("trace", []))
     trace.append({"node": "retrieve", "latency_ms": latency})
@@ -85,10 +102,11 @@ def grade_relevance_node(state: ChatState) -> ChatState:
     kept_chunks: list[dict] = []
 
     for chunk in chunks:
-        prompt = prompt_tpl.format(
+        prompt = render(
+            prompt_tpl,
             question=question,
             chunk_text=chunk.get("text", "")[:800],
-            chunk_source=chunk.get("metadata", {}).get("source_file", "unknown"),
+            chunk_source=_source_file(chunk.get("metadata") or {}),
         )
         try:
             resp = critic.invoke([HumanMessage(content=prompt)])
@@ -122,7 +140,8 @@ def _has_enough_evidence(state: ChatState) -> str:
 def rewrite_query_node(state: ChatState) -> ChatState:
     start = time.monotonic()
     prompt_tpl = _load("rag_rewrite.md")
-    prompt = prompt_tpl.format(
+    prompt = render(
+        prompt_tpl,
         question=state.get("question", ""),
         previous_rewrite=state.get("rewritten_query", ""),
     )
@@ -147,11 +166,10 @@ def generate_node(state: ChatState) -> ChatState:
     prompt_tpl = _load("rag_generate.md")
 
     chunks_text = "\n\n---\n\n".join(
-        f"[source: {c.get('metadata', {}).get('source_file', 'unknown')}#"
-        f"{c.get('metadata', {}).get('section', '')}]\n{c.get('text', '')}"
+        f"[source: {_citation(c.get('metadata') or {})}]\n{c.get('text', '')}"
         for c in chunks
     )
-    prompt = prompt_tpl.format(chunks=chunks_text, question=state.get("question", ""))
+    prompt = render(prompt_tpl, chunks=chunks_text, question=state.get("question", ""))
     llm = _llm("generator")
     try:
         resp = llm.invoke([HumanMessage(content=prompt)])
@@ -176,10 +194,10 @@ def verify_claims_node(state: ChatState) -> ChatState:
     prompt_tpl = _load("rag_verify_claims.md")
 
     chunks_text = "\n\n".join(
-        f"[{c.get('metadata', {}).get('source_file', 'unk')}]: {c.get('text', '')[:600]}"
+        f"[{_source_file(c.get('metadata') or {})}]: {c.get('text', '')[:600]}"
         for c in chunks
     )
-    prompt = prompt_tpl.format(draft_answer=draft, chunks=chunks_text)
+    prompt = render(prompt_tpl, draft_answer=draft, chunks=chunks_text)
     critic = _critic_json("critic")
 
     try:
@@ -248,7 +266,7 @@ def abstain_node(state: ChatState) -> ChatState:
 
 def finalize_rag_node(state: ChatState) -> ChatState:
     sources = [
-        f"{c.get('metadata', {}).get('source_file', 'unk')}#{c.get('metadata', {}).get('section', '')}"
+        _citation(c.get("metadata") or {})
         for c in state.get("retrieved_chunks", [])
     ]
     return {

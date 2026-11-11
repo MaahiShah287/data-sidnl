@@ -48,6 +48,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     route: str | None = None
+    router_error: str | None = None
     abstain_reason: str | None = None
     sql: str | None = None
     rows: list[dict] = []
@@ -96,6 +97,7 @@ def chat(req: ChatRequest):
     return ChatResponse(
         answer=final_state.get("final_answer", ""),
         route=final_state.get("route"),
+        router_error=final_state.get("router_error"),
         abstain_reason=final_state.get("abstain_reason"),
         sql=final_state.get("sanitised_sql"),
         rows=final_state.get("rows", []),

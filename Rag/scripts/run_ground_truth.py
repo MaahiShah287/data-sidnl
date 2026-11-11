@@ -77,10 +77,15 @@ def clean_rows(rows):
     return [{k: to_serializable(v) for k, v in r.items()} for r in rows]
 
 
-def extract_primary_value(rows):
+def extract_primary_value(rows, primary_column: str | None = None):
     if not rows:
         return None
     first = rows[0]
+    # An explicit column beats every heuristic below: the heuristic used to
+    # return `listing_count` instead of the metric (e.g. 489 stores -> 489
+    # listings), which silently corrupted the ground-truth value.
+    if primary_column and primary_column in first and first[primary_column] is not None:
+        return str(first[primary_column])
     priority = ["in_stock_pct", "oos_rate_pct", "avg_disc", "avg_sale_price",
                 "avg_position", "avg_organic_pos", "ad_pct", "avg_eta_minutes",
                 "in_stock_rate_pct", "avg_discount_pct", "sale_price", "mrp",
@@ -105,12 +110,29 @@ def extract_primary_value(rows):
 
 
 def parse_dsn(url):
-    m = re.match(r'postgresql://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)', url)
-    if m:
-        user, pw, host, port, dbname = m.groups()
-        return dict(host=host, port=int(port), dbname=dbname,
-                    user=user, password=pw, sslmode='require')
-    return None
+    """
+    Split a postgres DSN without breaking on passwords that contain '@' or ':'.
+
+    urlsplit() splits the userinfo at the LAST '@' and the password at the
+    FIRST ':', so raw (unencoded) special characters are handled correctly.
+    """
+    from urllib.parse import urlsplit, unquote
+
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname or not parts.path or parts.path == "/":
+        return None
+    return dict(
+        host=parts.hostname,
+        port=port or 5432,
+        dbname=unquote(parts.path.lstrip("/")),
+        user=unquote(parts.username or ""),
+        password=unquote(parts.password or ""),
+        sslmode="require",
+    )
 
 
 def main():
@@ -143,7 +165,7 @@ def main():
         print(f"  {qid}...", end=" ", flush=True)
         rows, err = run_sql(conn, sql, limit=10)
         rows = clean_rows(rows) if rows else rows
-        primary = extract_primary_value(rows) if rows else None
+        primary = extract_primary_value(rows, q.get("primary_column")) if rows else None
         status = "OK" if rows is not None else "ERR"
         print(f"[{status}] {len(rows) if rows else 0} rows  primary={primary}")
         if err:

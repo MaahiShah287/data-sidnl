@@ -54,5 +54,11 @@ class Settings(BaseSettings):
         alias="METRIC_DICTIONARY_PATH",
     )
 
+    # --- Documentation corpus (DEFINITION questions) ---
+    docs_dir: str = Field(
+        default=str(PROJECT_ROOT.parent / "data-sidnl" / "docs"),
+        alias="DOCS_DIR",
+    )
+
 
 settings = Settings()

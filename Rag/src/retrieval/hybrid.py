@@ -15,6 +15,7 @@ _chroma_client = None
 _collection = None
 _bm25_index = None
 _bm25_corpus: list[dict] = []   # [{id, text, metadata}]
+_embedder = None
 
 
 def _get_collection():
@@ -31,6 +32,15 @@ def _get_collection():
             metadata={"hnsw:space": "cosine"},
         )
     return _collection
+
+
+def _get_embedder():
+    """Load the sentence-transformers model once, not on every query."""
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(settings.embedding_model)
+    return _embedder
 
 
 def _get_bm25():
@@ -85,25 +95,35 @@ def _rrf_merge(
     return merged
 
 
-def retrieve(query: str, top_k: int | None = None) -> list[dict]:
+def retrieve(
+    query: str,
+    top_k: int | None = None,
+    doc_types: list[str] | None = None,
+) -> list[dict]:
     """
     Hybrid retrieval: Chroma vector search + BM25, fused with RRF.
     Returns top_k chunks sorted by RRF score.
     If the index is empty, returns [].
+
+    doc_types restricts both searches to those metadata doc_type values.
+    The RAG path answers DEFINITION questions, so it passes
+    ["metric", "documentation"]; otherwise 3,813 data-row chunks crowd the
+    32 documentation chunks out of the fused top-k.
     """
     k = top_k or settings.retrieval_top_k
+    where = {"doc_type": {"$in": doc_types}} if doc_types else None
 
     # --- Vector search ---
     coll = _get_collection()
     vec_results: list[dict] = []
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(settings.embedding_model)
+        model = _get_embedder()
         query_embedding = model.encode(query).tolist()
         qr = coll.query(
             query_embeddings=[query_embedding],
             n_results=min(k, coll.count() or 1),
             include=["documents", "metadatas", "distances"],
+            **({"where": where} if where else {}),
         )
         for id_, doc, meta, dist in zip(
             qr["ids"][0], qr["documents"][0], qr["metadatas"][0], qr["distances"][0]
@@ -116,14 +136,18 @@ def retrieve(query: str, top_k: int | None = None) -> list[dict]:
     bm25_results: list[dict] = []
     bm25_idx, corpus = _get_bm25()
     if bm25_idx and corpus:
-        from rank_bm25 import BM25Okapi
-        scores = bm25_idx.get_scores(query.lower().split())
-        ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:k]
-        for rank_i, (corpus_i, score) in enumerate(ranked):
-            item = dict(corpus[corpus_i])
-            item["bm25_score"] = score
-            item["bm25_rank"] = rank_i + 1
-            bm25_results.append(item)
+        candidates = [
+            (i, d) for i, d in enumerate(corpus)
+            if not doc_types or (d.get("metadata") or {}).get("doc_type") in doc_types
+        ]
+        if candidates:
+            scores = bm25_idx.get_scores(query.lower().split())
+            ranked = sorted(candidates, key=lambda x: scores[x[0]], reverse=True)[:k]
+            for rank_i, (corpus_i, item) in enumerate(ranked):
+                item = dict(item)
+                item["bm25_score"] = float(scores[corpus_i])
+                item["bm25_rank"] = rank_i + 1
+                bm25_results.append(item)
 
     if not vec_results and not bm25_results:
         return []

@@ -53,6 +53,7 @@ def score_response(question_rec: dict, resp: dict | None, exception: str | None)
     if exception or resp is None:
         return {
             "route_correct": False, "abstain_correct": False,
+            "no_data_correct": None,
             "numeric_grounded": None, "numeric_correct": None,
             "scope_stated": None, "draft_noted": None,
             "no_demo_leak": True, "sql_safe": None,
@@ -63,6 +64,9 @@ def score_response(question_rec: dict, resp: dict | None, exception: str | None)
 
     expected_route   = question_rec.get("expected_route", "")
     expect_abstain   = question_rec.get("expect_abstain", False)
+    # Coverage-gap questions: the data cannot answer them, so the correct
+    # behaviour is to say "no data" rather than to answer something else.
+    expect_no_data   = question_rec.get("expect_no_data", False)
     actual_route     = resp.get("route", "")
     actual_answer    = resp.get("answer", "") or ""
     actual_abstain   = bool(resp.get("abstain_reason"))
@@ -74,10 +78,14 @@ def score_response(question_rec: dict, resp: dict | None, exception: str | None)
 
     scores = {}
     scores["route_correct"]   = actual_route == expected_route
-    scores["abstain_correct"]  = actual_abstain == expect_abstain
+    scores["abstain_correct"]  = actual_abstain == (expect_abstain or expect_no_data)
+
+    # Coverage-gap questions pass only if the bot refuses to answer.
+    # Returning a number here means it silently changed the filters.
+    scores["no_data_correct"] = actual_abstain if expect_no_data else None
 
     # Numeric grounding: every number in answer must be in rows
-    if expected_route == "NUMERIC" and not expect_abstain and rows:
+    if expected_route == "NUMERIC" and not expect_abstain and not expect_no_data and rows:
         nums = _numbers_in_text(actual_answer)
         if nums:
             ungrounded = [n for n in nums if not _in_rows(n, rows)]
@@ -92,7 +100,7 @@ def score_response(question_rec: dict, resp: dict | None, exception: str | None)
 
     # Numeric correctness against ground truth
     gt_val = question_rec.get("ground_truth_value")
-    if gt_val is not None and expected_route == "NUMERIC":
+    if gt_val is not None and expected_route == "NUMERIC" and not expect_no_data:
         answer_nums = _numbers_in_text(actual_answer)
         try:
             gt_f = float(gt_val)
@@ -195,6 +203,7 @@ def run_pass(questions: list[dict], api_url: str, timeout: int, pass_num: int) -
             "question": question_text,
             "expected_route": q.get("expected_route"),
             "expect_abstain": q.get("expect_abstain"),
+            "expect_no_data": q.get("expect_no_data", False),
             "http_status": http_status,
             "wall_ms": wall_ms,
             "exception": exception,
@@ -273,8 +282,9 @@ def main():
     print("\n--- Quick Score Summary (pass 1) ---")
     p1 = [r for r in all_results if r["pass"] == 1]
     total = len(p1)
-    for key in ["route_correct", "abstain_correct", "no_demo_leak",
-                "sql_safe", "retry_ok", "numeric_grounded"]:
+    for key in ["route_correct", "abstain_correct", "no_data_correct",
+                "no_demo_leak", "sql_safe", "retry_ok", "numeric_grounded",
+                "numeric_correct", "source_cited"]:
         vals = [r["scores"].get(key) for r in p1 if r["scores"].get(key) is not None]
         if vals:
             pct = sum(1 for v in vals if v) / len(vals) * 100

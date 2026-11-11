@@ -81,6 +81,7 @@ def router_node(state: ChatState) -> ChatState:
 
     # 1. Keyword override (fast path)
     override = _keyword_override(question)
+    router_error = None
     if override:
         result = override
     else:
@@ -95,6 +96,7 @@ def router_node(state: ChatState) -> ChatState:
             result = json.loads(response.content)
         except Exception as exc:
             # Fail safe: route to AMBIGUOUS so the user gets a clarifying question
+            router_error = f"{type(exc).__name__}: {exc}"
             result = {
                 "route": "AMBIGUOUS",
                 "confidence": 0.0,
@@ -110,6 +112,7 @@ def router_node(state: ChatState) -> ChatState:
         **state,
         "route": result.get("route", "AMBIGUOUS"),
         "router_confidence": result.get("confidence", 0.0),
+        "router_error": router_error,
         "trace": trace,
         # Store detected language for later use
         "_detected_language": result.get("detected_language", "english"),

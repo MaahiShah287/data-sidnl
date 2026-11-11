@@ -40,9 +40,10 @@ def unsupported_node(state: ChatState) -> ChatState:
     answer = (
         f"⛔ This question cannot be answered with the available data.\n\n"
         f"{matched_msg}\n\n"
-        "**Available data**: price, availability, discount, delivery ETA, "
-        "ad placement, shelf position, organic position (across blinkit, zepto, "
-        "instamart, jiomart).\n\n"
+        "**Available data**: price, availability, discount, ad placement, shelf "
+        "position and organic position. Coverage is **Blinkit** (price/stock: "
+        "brand Mr. Munchies only; shelf: Amul + Mr. Munchies) and **Zepto shelf "
+        "position for Mumbai only**. There are no Instamart or JioMart rows.\n\n"
         "For SOV/SOH: check with your analytics lead for the company definition."
     )
 

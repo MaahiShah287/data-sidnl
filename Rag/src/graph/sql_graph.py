@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage
 
 from config import settings
 from db.safe_sql import validate_and_sanitise, SQLValidationError
+from graph.prompt_utils import render
 from graph.state import ChatState
 
 _PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -96,7 +97,8 @@ def plan_query_node(state: ChatState) -> ChatState:
     metric_info = json.dumps(matched, default=str) if matched else "null"
     metric_templates = _build_metric_templates_text(metrics)
 
-    prompt = _load_prompt("sql_planner.md").format(
+    prompt = render(
+        _load_prompt("sql_planner.md"),
         question=state.get("question", ""),
         metric_info=metric_info,
         metric_templates=metric_templates,
@@ -286,7 +288,8 @@ def format_answer_node(state: ChatState) -> ChatState:
         "status": state.get("metric_status"),
         "definition": state.get("metric_definition"),
     })
-    prompt = _load_prompt("sql_answer.md").format(
+    prompt = render(
+        _load_prompt("sql_answer.md"),
         sql=state.get("sanitised_sql", ""),
         rows=json.dumps(rows[:20], default=str),
         row_count=row_count,
