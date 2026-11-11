@@ -92,6 +92,11 @@ alter table silver.dim_city
 alter table silver.dim_store
     drop column if exists "store_weight (weight per store, e.g. store sales)";
 
+-- the rule "no out_of_stock from an incomplete read" is checked by silver.selftest(); this index holds exactly the rows
+-- that would break it (0 once backfilled), so the check reads nothing instead of scanning 2 M shelf rows
+create index if not exists ix_fsp_incomplete_oos on silver.fact_shelf_position (shelf_pos_key)
+    where shelf_complete is false and stock_status = 'out_of_stock';
+
 insert into silver.sidnl_config (key, value_num, description)
 values ('exclude_incomplete_reads', 1,
         '1 = a read with complete=false is flagged read_incomplete (suspect, out of metrics) and never yields out_of_stock; 0 = flag only (info_read_incomplete)')
@@ -391,7 +396,8 @@ begin
            c.price::numeric, c.mrp::numeric,
            c."position", c.organic_position, c.is_ad, null::text,
            pp.ptype, pp.name, pp.brand, pp.pack, pp.image_url,
-           ss.status::text, ss.complete::boolean, null::int, null::text, null::text,
+           -- stopped_early = the scraper stopped on purpose (enough cards seen): a finished read, not a partial one
+           ss.status::text, (ss.complete or coalesce(ss.stopped_early, false))::boolean, null::int, null::text, null::text,
            c.matched_by::text, c.variant_of::text
     from public.search_cards c
     join public.search_snapshots ss on ss.id = c.snapshot_id
@@ -696,13 +702,14 @@ CREATE OR REPLACE FUNCTION silver.backfill_read_flags(p_shelf_limit integer DEFA
 AS $function$
 declare
     v_excl boolean := coalesce(silver.cfg('exclude_incomplete_reads'), 1) = 1;
-    n_read bigint; n_shelf bigint;
+    n_read bigint; n_shelf bigint; n_scan bigint;
 begin
     with src as (
         select f.reading_key, f.source_type, f.store_key, f.observed_at, f.inventory_units, f.selling_price, f.mrp,
                f.stock_state_raw,
                case f.source_type when 'brand_search' then ss.status::text when 'category_shelf' then sn.status::text end as rs,
-               case f.source_type when 'brand_search' then ss.complete::boolean when 'category_shelf' then sn.complete::boolean end as rc,
+               case f.source_type when 'brand_search' then (ss.complete or coalesce(ss.stopped_early, false))::boolean
+                                    when 'category_shelf' then sn.complete::boolean end as rc,
                silver.safe_int(o.details::jsonb ->> 'max_allowed_quantity') as maq,
                nullif(btrim(o.details::jsonb ->> 'pack_size'), '')         as psz,
                nullif(btrim(o.details::jsonb ->> 'store_role'), '')        as srole,
@@ -751,7 +758,19 @@ begin
      where f.shelf_pos_key = t.shelf_pos_key;
     get diagnostics n_shelf = row_count;
 
+    -- store scans loaded before silver_069: the new search_snapshots columns
+    update silver.fact_store_scan f
+       set search_query = nullif(btrim(s.query::text), ''), latitude = s.lat::double precision,
+           longitude = s.lon::double precision, scan_error = nullif(left(s.error::text, 1000), '')
+      from public.search_snapshots s
+     where s.id = f.snapshot_id
+       and (f.search_query, f.latitude, f.longitude, f.scan_error)
+           is distinct from (nullif(btrim(s.query::text), ''), s.lat::double precision, s.lon::double precision,
+                             nullif(left(s.error::text, 1000), ''));
+    get diagnostics n_scan = row_count;
+
     return jsonb_build_object('fact_product_reading_updated', n_read, 'fact_shelf_position_updated', n_shelf,
+                              'fact_store_scan_updated', n_scan,
                               'shelf_done', n_shelf < p_shelf_limit, 'exclude_incomplete_reads', v_excl);
 end $function$
 ;
@@ -761,7 +780,7 @@ comment on function silver.read_flags(text, boolean, boolean) is 'read_failed (s
 comment on function silver.read_stock_status(text, text, boolean, boolean) is 'A failed or incomplete read never yields out_of_stock: it becomes unknown (silver_069).';
 comment on function silver.safe_int(text) is 'text -> integer, NULL for anything that is not a plain integer (bronze JSON fields).';
 comment on column silver.fact_product_reading.read_status is 'bronze snapshot status (search / shelf); NULL for product checks';
-comment on column silver.fact_product_reading.read_complete is 'bronze snapshot complete flag; false = partial read, never counted as out of stock';
+comment on column silver.fact_product_reading.read_complete is 'bronze snapshot complete flag (search: complete or stopped_early, which is a deliberate stop); false = partial read, never counted as out of stock';
 comment on column silver.fact_product_reading.max_allowed_quantity is 'observations.details.max_allowed_quantity (units cap per order)';
 comment on column silver.fact_product_reading.pack_size_seen is 'observations.details.pack_size as shown at that store';
 comment on column silver.fact_product_reading.store_role is 'observations.details.store_role';

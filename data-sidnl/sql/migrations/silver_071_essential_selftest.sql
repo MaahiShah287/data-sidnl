@@ -3,7 +3,7 @@
 -- Before: selftest_parser() = 61 one-line asserts that stop at the first failure (and only say its name),
 --         selftest_matcher() = 9 tests, quality_checks() re-runs both plus 4 integrity checks, and the Python tests
 --         re-ran all three again (~85 executions, many duplicates).
--- After:  silver.selftest() = 32 named behaviours. Every bronze input string of the old asserts is still checked
+-- After:  silver.selftest() = 35 named behaviours. Every bronze input string of the old asserts is still checked
 --         (grouped by behaviour, none dropped); each test reports ALL failing inputs with got/expected; plus three
 --         new checks the old suite missed: the failed/incomplete-read rule (data), personal data never read
 --         (demo_requests), every sidnl-* cron job active.

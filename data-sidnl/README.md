@@ -23,10 +23,11 @@ ops     run history, quality results, alerts, checks       (ops.*)
 | `sql/03_views_jobs_config.sql` | views, grants, configuration rows, the pg_cron jobs |
 | `sql/rollbacks.sql` | the rollback for each migration since `silver_041` (undo newest first) |
 | `sql/manifest.csv` | every applied migration: version, name, md5 of the applied SQL |
-| `sql/pending/` | migrations written but **not yet applied** (apply order in `ORDER`, rollbacks in `rollbacks_pending.sql`); see [docs/PIPELINE_STATUS_2026-11-11.md](docs/PIPELINE_STATUS_2026-11-11.md) |
+| `sql/migrations/` | exact SQL of the migrations applied since 2026-11-11 (`silver_069`–`072`, `dash_011`); md5 in `manifest.csv`, checked by the tests. Status report: [docs/PIPELINE_STATUS_2026-11-11.md](docs/PIPELINE_STATUS_2026-11-11.md) |
+| `sql/pending/` | migrations written but not yet applied (apply order in `ORDER`); empty today |
 | `sidnl.py` | command line (below) |
 | `tests/test_live_db.py` | tests against the live database (skipped without `SUPABASE_DB_URL`) |
-| `tests/test_offline.py` | tests that need no database: bronze→silver column contract, pending migrations (rollback, preflight, parse), CLI retry |
+| `tests/test_offline.py` | tests that need no database: bronze→silver column contract, migrations (rollback, md5, preflight, parse), CLI retry |
 | `portal/` | Next.js dashboard reading `dash.*` |
 
 `sql/01..03` are **generated** from the live database (`python sidnl.py export-schema`) and checked by
@@ -58,6 +59,7 @@ python -m unittest discover -s tests -v
 | `sidnl-maintenance` | 19:05 UTC | purges cron history > 14 days, analyzes tables without statistics |
 | `sidnl-reconcile` | 19:20 UTC | proves every silver row equals its bronze row and every dash number equals silver |
 | `sidnl-reconcile-coverage` | 19:40 UTC | proves no bronze shelf row was skipped (in silver or dead-lettered) |
+| `sidnl-context` | every 10 min | `silver.refresh_scrape_context()` then `dash.refresh_context()`: run logs, shelf reads, serviceability, listings into silver; `dash.coverage` + `dash.collection_health`. Each part isolated; result in `ops.etl_run` (`brand_key = '_context'`) |
 | `sidnl-alerts` | every minute | `silver.deliver_alerts()`: sends queued alerts to Slack (off until you add the webhook and switch it on) |
 
 ## Where to look
@@ -70,6 +72,9 @@ select * from ops.v_dead_letter_summary;      -- bronze rows that could not be l
 select * from ops.v_cron_health;              -- every sidnl-* job: runs, failures, streak
 select * from ops.cron_alert_log order by alert_id desc limit 20;   -- every alert raised
 select * from dash.v_brand_scorecard_latest where brand_key = 'amul';  -- a brand's market position
+select * from silver.selftest() where not ok;  -- the self-test suite (35 tests); no rows = all pass
+select * from dash.collection_health order by obs_date desc;  -- scrape runs ok / partial / failed per day
+select * from dash.coverage order by obs_date desc;  -- serviceable points per platform x city
 ```
 
 ## Runbook: if X breaks, do Y

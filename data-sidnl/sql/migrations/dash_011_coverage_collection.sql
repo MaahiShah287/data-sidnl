@@ -26,6 +26,8 @@ create table if not exists dash.collection_health (
     platform             text not null,
     job_type             text not null,
     runs                 integer not null,
+    runs_ok              integer not null,
+    runs_partial         integer not null,
     runs_failed          integer not null,
     runs_unfinished      integer not null,
     stores_planned       integer,
@@ -74,13 +76,21 @@ begin
     get diagnostics n_cov = row_count;
 
     delete from dash.collection_health;
-    insert into dash.collection_health (obs_date, platform, job_type, runs, runs_failed, runs_unfinished, stores_planned,
+    insert into dash.collection_health (obs_date, platform, job_type, runs, runs_ok, runs_partial, runs_failed,
+                                        runs_unfinished, stores_planned,
                                         stores_done, stores_failed, store_completion_pct, blocked, requests,
                                         shelf_reads, shelf_reads_ok)
     with r as (
         select (r.started_at at time zone 'Asia/Kolkata')::date as obs_date, coalesce(r.platform, '(unknown)') as platform,
                r.job_type, r.job_id, r.status, r.finished_at,
-               coalesce(r.stores_planned, r.points_planned) as planned, coalesce(r.stores_done, r.points_done) as done,
+               coalesce(r.stores_planned, r.points_planned) as planned,
+               -- check runs can report more points done than planned: a run never counts above 100 %
+               least(coalesce(r.stores_done, r.points_done), coalesce(r.stores_planned, r.points_planned)) as done,
+               -- bronze status words: done | failed, blocked | partial, stopped, interrupted (+ running while open)
+               case when r.finished_at is null then 'open'
+                    when r.status ~* '^(done|ok|success|completed?)$' then 'ok'
+                    when r.status ~* '(fail|error|blocked|abort|cancel)' then 'failed'
+                    else 'partial' end as outcome,
                r.stores_failed, r.blocked, r.requests
           from silver.fact_scrape_run r
          where r.started_at is not null),
@@ -88,8 +98,8 @@ begin
         select s.obs_date, s.platform, s.sweep_id, count(*) as reads, count(*) filter (where s.read_ok) as ok
           from silver.fact_shelf_snapshot s where s.sweep_id is not null group by 1, 2, 3)
     select r.obs_date, r.platform, r.job_type, count(*),
-           count(*) filter (where r.status ~* '(fail|error|abort|cancel)'),
-           count(*) filter (where r.finished_at is null),
+           count(*) filter (where r.outcome = 'ok'), count(*) filter (where r.outcome = 'partial'),
+           count(*) filter (where r.outcome = 'failed'), count(*) filter (where r.outcome = 'open'),
            sum(r.planned), sum(r.done), sum(r.stores_failed),
            round(100.0 * sum(r.done) / nullif(sum(r.planned), 0), 2),
            sum(r.blocked), sum(r.requests),
@@ -108,7 +118,7 @@ end $function$
 ;
 
 comment on table dash.coverage is 'Serviceability per day x platform x city x source (check_point / coverage / fulfilment_probe). serviceable_pct = points_serviceable / points_checked; roll up as SUM/SUM. Not serviceable is never out of stock.';
-comment on table dash.collection_health is 'Scrape runs per day x platform x job type: failed / unfinished runs, store completion (done / planned), blocked, requests; category sweeps also count shelf reads and reads that worked.';
+comment on table dash.collection_health is 'Scrape runs per day x platform x job type: ok (done) / partial (partial, stopped, interrupted) / failed (failed, blocked) / unfinished runs, store completion (done capped at planned per run, / planned), blocked, requests; category sweeps also count shelf reads and reads that worked.';
 comment on function dash.refresh_context() is 'Rebuilds dash.coverage and dash.collection_health from silver (dash_011). Called by cron sidnl-context after silver.refresh_scrape_context().';
 
 -- the job: silver first; dash only after it, in the same transaction

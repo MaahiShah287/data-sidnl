@@ -2,9 +2,10 @@
 
     python -m unittest discover -s tests -v
 
-They pin the bronze -> silver column contract ("Bronze -> Silver: which columns to carry", 2026-11-10) to the pending
-migrations, check every pending migration has a rollback and parses as PostgreSQL (when pglast is installed), and
-check the command line's retry and ordering logic.
+They pin the bronze -> silver column contract ("Bronze -> Silver: which columns to carry", 2026-11-10) to the
+migrations (applied: sql/migrations, pending: sql/pending), check every migration has a rollback, that applied ones
+match the md5 recorded in sql/manifest.csv, that they parse as PostgreSQL (when pglast is installed), and check the
+command line's retry and ordering logic.
 """
 import os
 import pathlib
@@ -17,15 +18,13 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import sidnl  # noqa: E402
 
-PENDING = sidnl.PENDING_DIR
-
-
 def sql(name):
-    return (PENDING / name).read_text(encoding="utf-8")
+    return next(p for p in sidnl.migration_files() if p.name == name).read_text(encoding="utf-8")
 
 
 def all_pending_sql():
-    return "\n".join(p.read_text(encoding="utf-8") for p in sidnl.pending_files())
+    """Every migration of this work, applied (sql/migrations) or pending (sql/pending)."""
+    return "\n".join(p.read_text(encoding="utf-8") for p in sidnl.migration_files())
 
 
 # bronze table -> columns the doc says to carry, each with the silver column that must receive it
@@ -93,9 +92,9 @@ class ColumnContract(unittest.TestCase):
         self.assertIn("'read_incomplete'] then 'suspect'", text)
 
 
-class PendingMigrations(unittest.TestCase):
+class Migrations(unittest.TestCase):
     def test_order_lists_existing_files(self):
-        files = sidnl.pending_files()
+        files = sidnl.migration_files()
         self.assertGreater(len(files), 0)
         for f in files:
             self.assertTrue(f.exists(), f)
@@ -104,10 +103,26 @@ class PendingMigrations(unittest.TestCase):
         self.assertLess(names.index("silver_069_bronze_column_contract.sql"), names.index("silver_071_essential_selftest.sql"))
 
     def test_every_migration_has_a_rollback(self):
-        rb = sql("rollbacks_pending.sql")
-        for f in sidnl.pending_files():
-            mig = f.stem.split("_")[0] + "_" + f.stem.split("_")[1]
-            self.assertIn(f"rollback {mig}", rb, f"{f.name} has no rollback block")
+        rb = (sidnl.SQL_DIR / "rollbacks.sql").read_text(encoding="utf-8")
+        pending_rb = sidnl.PENDING_DIR / "rollbacks_pending.sql"
+        if pending_rb.exists():
+            rb += pending_rb.read_text(encoding="utf-8")
+        for f in sidnl.migration_files():
+            mig = "_".join(f.stem.split("_")[:2])
+            self.assertTrue(f" {f.stem}\n" in rb or f"rollback {mig}" in rb, f"{f.name} has no rollback block")
+
+    def test_applied_migrations_match_manifest_md5(self):
+        import csv
+        import hashlib
+        with sidnl.MANIFEST.open(encoding="utf-8") as fh:
+            md5 = {r["name"]: r["md5"] for r in csv.DictReader(fh)}
+        files = sorted(sidnl.MIGRATIONS_DIR.glob("*.sql"))
+        self.assertGreater(len(files), 0)
+        for f in files:
+            with self.subTest(f=f.name):
+                text = f.read_text(encoding="utf-8").replace("\r\n", "\n")
+                self.assertEqual(hashlib.md5(text.encode()).hexdigest(), md5.get(f.stem),
+                                 "file differs from the SQL that was applied")
 
     def test_bronze_columns_checked_before_any_change(self):
         for name in ("silver_069_bronze_column_contract.sql", "silver_070_scrape_context.sql"):
@@ -118,7 +133,7 @@ class PendingMigrations(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("pglast"), "pglast not installed (pip install pglast)")
     def test_migrations_parse_as_postgresql(self):
         from pglast import parser
-        for f in sidnl.pending_files():
+        for f in sidnl.migration_files():
             with self.subTest(f=f.name):
                 text = f.read_text(encoding="utf-8")
                 parser.parse_sql(text)

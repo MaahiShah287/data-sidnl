@@ -1,7 +1,4 @@
 # Apply order of the migrations in this folder (one per line). `python sidnl.py dry-run` uses it.
-# When a migration is applied: move its rollback block into sql/rollbacks.sql, delete its file and its line here.
-silver_069_bronze_column_contract.sql
-silver_070_scrape_context.sql
-dash_011_coverage_collection.sql
-silver_071_essential_selftest.sql
-silver_072_dq_gate_window.sql
+# When a migration is applied: move it to sql/migrations/, its rollback block into sql/rollbacks.sql,
+# add it to sql/manifest.csv, and delete its line here.
+silver_073_inline_row_functions.sql

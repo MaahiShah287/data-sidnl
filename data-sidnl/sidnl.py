@@ -28,6 +28,7 @@ log = logging.getLogger("sidnl")
 ROOT = pathlib.Path(__file__).resolve().parent
 SQL_DIR = ROOT / "sql"
 PENDING_DIR = SQL_DIR / "pending"
+MIGRATIONS_DIR = SQL_DIR / "migrations"   # applied since 2026-11-11 (exact SQL; md5 in manifest.csv)
 SCHEMA_FILES = {
     "tables": SQL_DIR / "01_tables.sql",
     "functions": SQL_DIR / "02_functions.sql",
@@ -196,6 +197,13 @@ def pending_files():
         return []
     names = [ln.strip() for ln in order.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
     return [PENDING_DIR / n for n in names]
+
+
+def migration_files():
+    """Applied migrations kept in the repo (sql/migrations), in manifest order, then the pending ones."""
+    order = [ln.split(",")[1] for ln in MANIFEST.read_text(encoding="utf-8").splitlines()[1:] if ln.strip()]
+    applied = [MIGRATIONS_DIR / f"{n}.sql" for n in order if (MIGRATIONS_DIR / f"{n}.sql").exists()]
+    return applied + pending_files()
 
 
 def timed(conn, sql, repeat=3):
