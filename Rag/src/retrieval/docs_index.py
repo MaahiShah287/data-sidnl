@@ -6,6 +6,7 @@ look like"; they do not answer "what does this metric mean". DEFINITION
 questions need real documentation, so this module turns:
 
   * metrics/metric_dictionary.yaml  -> one document per metric
+  * metrics/*.md                    -> curated prose kept next to the dictionary
   * markdown under docs/            -> one document per heading
 
 into Chroma chunks with a stable metadata schema:
@@ -201,8 +202,35 @@ def documentation_documents(docs_dir: str | Path) -> list[dict]:
     return docs
 
 
+def metrics_dir_documents(metric_dict_path: str | Path) -> list[dict]:
+    """
+    Curated markdown that sits next to the metric dictionary.
+
+    The dictionary only carries per-metric facts; questions like "what does
+    draft status mean?" need prose that is not tied to one metric. Those files
+    live in metrics/ (e.g. status_vocabulary.md) and are indexed with a
+    metrics/ prefix so citations point at the real file.
+    """
+    root = Path(metric_dict_path).parent
+    if not root.exists():
+        return []
+
+    docs: list[dict] = []
+    for path in sorted(root.glob("*.md")):
+        if not path.is_file() or _SKIP_PATTERNS.search(path.name):
+            continue
+        source_file = f"metrics/{path.name}"
+        docs.extend(chunk_markdown(path.read_text(encoding="utf-8"), source_file))
+
+    return docs
+
+
 def all_doc_chunks(metric_dict_path: str | Path, docs_dir: str | Path) -> list[dict]:
-    return metric_documents(metric_dict_path) + documentation_documents(docs_dir)
+    return (
+        metric_documents(metric_dict_path)
+        + metrics_dir_documents(metric_dict_path)
+        + documentation_documents(docs_dir)
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -127,6 +127,26 @@ def test_all_doc_chunks_combines_both_sources(tmp_path):
     assert kinds == {"metric", "documentation"}
 
 
+def test_metrics_dir_markdown_is_indexed_with_metrics_prefix(tmp_path):
+    metrics = tmp_path / "metric_dictionary.yaml"
+    metrics.write_text("metrics:\n  - name: m1\n    definition: d\n", encoding="utf-8")
+    (tmp_path / "status_vocabulary.md").write_text(
+        "# Metric status vocabulary\n\nDraft means not signed off.\n", encoding="utf-8"
+    )
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+
+    chunks = all_doc_chunks(metrics, docs_dir)
+    prose = [
+        c for c in chunks
+        if c["metadata"]["source_file"] == "metrics/status_vocabulary.md"
+    ]
+    assert len(prose) == 1
+    assert prose[0]["metadata"]["source_file"] == "metrics/status_vocabulary.md"
+    assert prose[0]["metadata"]["section"] == "Metric status vocabulary"
+    assert "Draft means not signed off." in prose[0]["text"]
+
+
 # ---------------------------------------------------------------------------
 # Metadata backfill (the "unknown#" bug)
 # ---------------------------------------------------------------------------

@@ -1,7 +1,10 @@
 # SIDNL Chatbot
 
-Quick-commerce analytics chatbot for Blinkit / Zepto / Instamart / Jiomart data.
-A LangGraph router sends each question down one of two paths:
+Quick-commerce analytics chatbot over the SIDNL silver views. Coverage is
+deliberately narrow: price/availability for Blinkit (brand Mr. Munchies only),
+shelf position for Blinkit (Amul, Mr. Munchies) and Zepto (Mumbai only); there
+are no Instamart or JioMart rows. A LangGraph router sends each question down
+one of two paths:
 
 - **SQL path** — the LLM plans a read-only query against the silver views; a
   keyword/allowlist firewall (`src/db/safe_sql.py`) plus a read-only pool
@@ -30,9 +33,13 @@ Run everything with `.\.venv\Scripts\python.exe` from `Rag/`.
 ## Build / refresh the index
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\build_index.py   # full rebuild (~45-50 min on CPU)
-.\.venv\Scripts\python.exe scripts\add_docs.py      # append docs only, keeps row embeddings
+.\.venv\Scripts\python.exe scripts\build_index.py   # full rebuild (~5.5 h on CPU)
+.\.venv\Scripts\python.exe scripts\add_docs.py      # append docs only, keeps row embeddings (~30 s)
 ```
+
+A full rebuild can exit non-zero with a Chroma "Error in compaction" message
+*after* the write succeeded — check `collection.count()` before rebuilding
+again (see `HANDOFF.md` Error 4).
 
 ## Run the API
 

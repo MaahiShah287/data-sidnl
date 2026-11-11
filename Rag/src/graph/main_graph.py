@@ -72,17 +72,20 @@ def ambiguous_node(state: ChatState) -> ChatState:
             "- Availability / in-stock rate\n"
             "- Price or discounts\n"
             "- Ad placement rate\n"
-            "- Shelf position / organic position\n"
-            "- Delivery ETA\n\n"
-            "Also, do you want this for a specific city, brand, or category?"
+            "- Shelf position / organic position\n\n"
+            "Also, do you want this for a specific city, brand, or category?\n\n"
+            "_Note: price/stock data covers Blinkit for brand Mr. Munchies; shelf "
+            "data covers Blinkit (Amul, Mr. Munchies) and Zepto Mumbai only._"
         )
     else:
         clarifier = (
             "Your question is a bit broad. Could you tell me:\n\n"
-            "1. **Which platform?** (Blinkit, Zepto, Instamart, JioMart)\n"
+            "1. **Which platform?** (Blinkit, or Zepto shelf data for Mumbai)\n"
             "2. **Which metric?** (price, availability, discount, ad placement, position)\n"
-            "3. **Any filters?** (city, brand, category, time range)\n\n"
-            "Example: \"What is the in-stock rate for brand X on Blinkit in Mumbai?\""
+            "3. **Any filters?** (city, brand, category)\n\n"
+            "Example: \"What is the in-stock rate for brand X on Blinkit in Mumbai?\"\n\n"
+            "_Note: there are no Instamart or JioMart rows, and delivery ETA is "
+            "not populated in the silver layer._"
         )
 
     trace = list(state.get("trace", []))

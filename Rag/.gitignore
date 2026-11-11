@@ -32,7 +32,10 @@ htmlcov/
 
 # Local databases & artifacts
 chroma_db/
-reports/
+# Keep the small markdown reports (baseline evidence) but ignore bulk output:
+# eval_results.jsonl, rebuild.log and embed_cache/ stay local.
+reports/*
+!reports/*.md
 *.log
 
 # Virtual environments

@@ -42,13 +42,14 @@ LangGraph router → either a **RAG pipeline** (retrieve docs from Chroma → gr
   - groups 25 rows into one text document (`col: value | col: value` lines, metadata: `source_view`, `platform`, `store`),
   - embeds locally with `intfloat/multilingual-e5-base`, writes to Chroma collection `sidnl_docs` at `./chroma_db` (paths from `.env`).
 - **Important detail:** ingestion reads via the read-only pool *directly* (`db.client.get_conn`), NOT `execute_safe`, because `safe_sql.py` auto-appends `LIMIT 200` to every query — using it silently truncated the index. Keep this in mind if you add more views; use direct pool reads for ingestion, never `execute_safe` for bulk loads.
-- Final index: **3,813 documents** from 56,249 (`v_all_platforms`) + 5,055 (`v_latest_observation`) + 33,991 (`v_latest_shelf_position`) rows. Build takes ~45-50 min on CPU.
-- Re-running `build_index.py` deletes and re-creates the collection (always mirrors the views).
+- Final index: **3,845 documents** = 3,813 row chunks (from 56,249 `v_all_platforms` + 5,055 `v_latest_observation` + 33,991 `v_latest_shelf_position` rows, 25 rows per chunk) + 32 doc chunks (16 metric + 16 documentation). A full rebuild took **5 h 29 min** on CPU (torch uses 10/12 cores); `scripts/add_docs.py` appends docs in ~30 s without re-embedding rows.
+- Re-running `build_index.py` deletes and re-creates the collection (always mirrors the views). It can exit non-zero on a post-write Chroma compaction error even though the data landed — see Error 4.
 - Retrieval smoke test passed: `retrieval.hybrid.retrieve('zepto in stock rate')` returns hits from the index.
 
 ### 4. LLM
-- OpenAI provider configured in `Rag/.env` (`LLM_API_KEY`, `LLM_API_BASE=https://api.openai.com/v1`, `gpt-4o-mini` for generator/critic/router). `ChatOpenAI` is used everywhere with `base_url` from config, so any OpenAI-compatible endpoint (e.g. Groq with `LLM_API_BASE=https://api.groq.com/openai/v1`) works by swapping key+URL+model names.
-- ⚠️ An earlier OpenAI key was exposed while debugging and **should be treated as revoked**; use only the current key in `.env`.
+- **Current provider: Groq** (`LLM_API_BASE=https://api.groq.com/openai/v1`, model `openai/gpt-oss-120b`) — OpenAI returned `429 You have no credits remaining`, so the OpenAI key is dead but the code path is unchanged (see Error 2).
+- `ChatOpenAI` is used everywhere with `base_url` from config, so any OpenAI-compatible endpoint works by swapping key + URL + model names.
+- ⚠️ Two keys have been exposed while debugging and **must be treated as revoked**: the earlier OpenAI key, and the Groq `gsk_...` key pasted in chat on 2026-11-11. Use only a freshly rotated key in `.env`.
 
 ## How to run the chatbot / verify setup (fresh machine)
 
@@ -64,10 +65,24 @@ python -m venv .venv
 ## Next steps / pending work
 
 0. **Fallback mechanisms (UPDATED 2026-11-10 evening):** Gap 2 (freshness) was implemented by Hardi as `silver_062_bronze_freshness` (already applied). Gaps 3/4/5 are written but **not applied**: `silver_063` (dead-letter, Option A), `silver_064` (heartbeat + lock-safe daily cron), `silver_065` (alert outbox bridging all alert logs incl. freshness to Slack), plus edge functions in `data-sidnl/edge-functions/`. Apply in order **063 → 064 → 065** via Supabase SQL editor (admin), then the `[ADMIN]` items marked inside each file (Gap 3 loader predicates, run_tick/record_storage_snapshot hooks, pg_net enable, edge-function deploy + secrets). Decisions logged in `fallbacks-design.md` header (Q1–Q6). Phase 3 test plan in the same doc.
-1. **End-to-end smoke test of the app** (`src/api/app.py` with uvicorn) — the LLM path has NOT been exercised against real queries yet. Do a question like "What is the in-stock rate for Zenly on Zepto?" and confirm routing, SQL, and generation all work.
-2. **RAG pipeline quality** — the retrieval → grade → generate → verify graph (`src/graph/rag_graph.py`, prompts in `src/prompts/`) was wired but not evaluated. Run `Rag/eval/run_eval.py` after filling ground truth via `scripts/run_ground_truth.py`, and look at `Rag/OPEN_QUESTIONS.md` open items.
-3. **E5 prefixes** — `multilingual-e5-base` is trained with `query:`/`passage:` prefixes. Current code embeds bare strings in both `build_index.py` and `hybrid.py` (consistent, but suboptimal). If answer quality is weak, add prefixes to BOTH files together.
-4. **Rotation/cleanup** — rotate the role password once more (it appeared in chat logs), and confirm `.env` never gets committed (`git check-ignore Rag/.env`).
+1. **End-to-end smoke test of the app** — **DONE 2026-11-11.** `uvicorn api.app:app`
+   on :8000, all four routes exercised (NUMERIC / DEFINITION / UNSUPPORTED /
+   AMBIGUOUS), `router_error` unset, smoke script exits 0.
+2. **RAG pipeline quality** — baseline done 2026-11-11 (`Rag/reports/eval_baseline.md`).
+   The planner literal-value bug is fixed (Error 5) and spot-checked 6/6; a full
+   75-question re-run on `openai/gpt-oss-120b` is pending the daily quota reset.
+   `metrics/status_vocabulary.md` is now indexed, so "what does draft status
+   mean" has a source.
+3. **E5 prefixes** — **CLOSED 2026-11-11.** Measured on the 32 doc chunks; the
+   gain is negligible and the right chunk already ranks #1. Do **not** re-embed
+   3,813 rows for prefixes. Relevance was fixed with route-aware `doc_types`
+   filtering instead (see session log).
+4. **Rotation/cleanup** — the Groq key was pasted in chat and **must be
+   rotated** (console.groq.com → API keys). It was also echoed into a terminal
+   transcript on 2026-11-11 (`Get-Content .env` filter matched `LLM_API_KEY`),
+   so treat it as compromised. Also rotate the role password once more (it
+   appeared in chat logs), and confirm `.env` never gets committed
+   (`git check-ignore Rag/.env`).
 5. **`sql/02_diagnostics.sql`** — still open per `OPEN_QUESTIONS.md`: run blocks against Supabase to resolve `scrape_status` TODOs in `01_views.sql`.
 6. **Pipeline (next phase, owner noted in chat):** continue silver→gold pipeline work as before; the chatbot side is now unblocked for that work.
 
@@ -218,6 +233,170 @@ LLM is called. It is invisible in unit tests because no test renders a prompt.
 Fix: new `src/graph/prompt_utils.py` with `render(template, **kwargs)`, which
 substitutes only `{lower_case_identifier}` placeholders and leaves JSON
 braces untouched. All six `.format()` call sites now use it.
+
+#### Error 4 — Chroma raises a compaction error *after* a successful write
+
+```
+chromadb.errors.InternalError: Error in compaction: Failed to apply logs to
+the metadata segment
+  File "scripts/build_index.py", line 175, in build
+    collection.add(ids=..., documents=..., metadatas=..., embeddings=...)
+```
+
+The run had already spent **5 h 29 min** embedding 3,813 documents. The
+exception looked like data loss, but it is not:
+
+```python
+col.count()            # 3813
+col.get(limit=3, ...)  # returns ids + metadata + documents
+col.query(...)         # returns hits
+```
+
+`chroma_db/chroma.sqlite3` is ~681 MB and the collection is complete. Chroma
+1.5.9 fails in a *post-write compaction* step, so the rows are durable and the
+error is cosmetic — but the build script cannot tell the difference and exits
+non-zero.
+
+**Do not re-embed to "fix" this.** Verify with `col.count()` / `col.get()` /
+`col.query()` first. To append documentation to an existing collection use
+`scripts/add_docs.py`, which took ~30 s instead of 5.5 h:
+
+```
+Backfilled metadata on 0 row documents; upserted 32 doc chunks.
+Collection now has 3845 documents (was 3813).
+```
+
+**Fixed 2026-11-11:** `build_index.py` now (a) writes in `ADD_BATCH = 256`
+chunks so one failed transaction cannot take out the whole load, and (b) caches
+the embeddings in `reports/embed_cache/rows-<fingerprint>.npy` (git-ignored,
+keyed by a hash of ids+texts+model). A re-run with an unchanged corpus reuses
+the array and skips the ~5.5 h encode entirely. The fingerprint includes the
+document text, so editing row text invalidates the cache automatically.
+
+A second, unrelated symptom followed: the next Chroma process hung for >15 min
+with no output while a `chroma.sqlite3-journal` was present. Direct SQLite
+access showed the DB was healthy (`collections: 1`, `embeddings: 3845`,
+`metadata rows: 34445`) and the journal disappeared; subsequent Chroma opens
+took 0.5 s. If this recurs, check for the journal file and a stale process
+before assuming corruption.
+
+#### Retrieval relevance — route-aware filtering, not E5 prefixes
+
+`retrieve("What is observed_in_stock_rate and how is it calculated?")` put the
+correct metric chunk at #1 in a docs-only ranking but **5th** in the real hybrid
+search, because 3,813 `data_rows` chunks outrank the 32 `metric`/`documentation`
+chunks in RRF fusion.
+
+Measured E5 `query:`/`passage:` prefixes on the 32 doc chunks: they barely
+change ranking (the right chunk is already #1 without them), so re-embedding
+3,813 rows for prefixes was **rejected** as a 5.5 h cost for no gain.
+
+Fix instead: `retrieve(query, top_k, doc_types=...)` filters *both* the vector
+query (`where={"doc_type": {"$in": [...]}}`) and the BM25 candidate list;
+`rag_graph.retrieve_node` passes `["metric", "documentation"]` only for the
+DEFINITION route. After the fix, `observed_in_stock_rate` ranks first and
+`avg_discount_pct` ranks first for its question.
+
+#### Eval rewrite — the original questions did not match the data
+
+`reports/eval_feasibility.md` (generated by `scripts/run_ground_truth.py`'s
+sibling audit) found only **2 answerable, 2 degraded and 21 not answerable**
+questions out of the original 25 NUMERIC set. The original ground-truth SQL
+also contradicted the question text in 18 of 25 cases (e.g. N02 asked for
+Zepto/Mumbai/Haldiram but filtered `blinkit`/`Mr. Munchies`), so those values
+were discarded rather than tuned.
+
+Decision (user-approved, "hybrid: honesty + accuracy"):
+
+- keep **8** unanswerable questions as `expect_no_data` honesty tests — the bot
+  must abstain, not silently change filters;
+- rewrite the remaining questions to real data and add 10 new answerable ones
+  (N26–N35);
+- add an explicit `primary_column` per question, because the
+  `extract_primary_value` heuristic returned `listing_count` instead of the
+  metric (N07 reported 489 listings instead of 68 stores);
+- `eval/run_eval.py` scores `no_data_correct` and treats `expect_no_data` as
+  "abstention is the correct answer".
+
+Resulting set: **75 questions** — 37 NUMERIC (25 slots + N26–N35), 8
+`expect_no_data`, 27 answerable overall, 38 non-numeric. All 35 SQL-bearing
+questions execute; the 8 coverage gaps return 0 rows.
+
+### 2026-11-11 — verification, API smoke test, eval baseline
+
+- All 75 tests pass (`pytest -q`), `compileall` clean.
+- `uvicorn api.app:app` on :8000: all four routes exercised. NUMERIC, DEFINITION,
+  UNSUPPORTED and AMBIGUOUS each return the expected route with `router_error`
+  unset. `"What is the in-stock rate for Mr Munchies on Zepto?"` correctly
+  abstains (no Zepto price/stock rows) instead of inventing a number.
+- `metrics/status_vocabulary.md` added and `metrics/*.md` is now indexed, so
+  "what does draft status mean?" has prose to retrieve. `metrics/` files are
+  chunked by heading with a `metrics/<file>.md` citation prefix.
+- Accuracy fixes: the AMBIGUOUS clarifier no longer offers "Delivery ETA"
+  (100% NULL) or lists Instamart/JioMart as if they had rows; the router prompt
+  now routes ETA and Instamart/JioMart questions to UNSUPPORTED and states the
+  real coverage.
+- Baseline: `eval/run_eval.py --timeout 240 --passes 2` against the running API.
+  The default 60 s timeout is too short — DEFINITION calls were observed at
+  93 s. Results in `reports/eval_results.jsonl` (git-ignored); summary in
+  `reports/eval_baseline.md`.
+- **Environment note:** the dev machine hit 0 bytes free mid-session, which
+  made an editor write truncate `scripts/build_index.py` to 0 bytes. It was
+  restored with `git checkout --` and re-applied. Freeing the pip cache
+  (~1.9 GB) and `%TEMP%` fixed it. If an edit fails oddly, check disk space
+  before debugging the file.
+- **Baseline result:** pass 1 scored `route_correct` 89% (97% excluding three
+  mislabelled adversarial questions), `no_data_correct` 8/8, `no_demo_leak`
+  75/75, `sql_safe` 34/34, `source_cited` 15/15, no hallucinations — and
+  `numeric_correct` **0/27**, because of Error 5 below. Details and caveats in
+  `reports/eval_baseline.md`.
+- **Pass 2 is invalid:** 57 of 75 requests hit Groq's daily token cap; the
+  router fails safe to AMBIGUOUS, so the "53 unstable questions" figure is an
+  infrastructure artifact. Do not quote it.
+
+#### Error 5 — the planner used title-case literals, so every NUMERIC query returned 0 rows
+
+Symptom: `numeric_correct` was 0/27 and every NUMERIC answer was
+"No matching observations found", even though the SQL was valid and `sql_safe`
+passed.
+
+Cause: the generated SQL filtered `platform = 'Blinkit'`, but the views store
+`'blinkit'` and Postgres string comparison is case-sensitive:
+
+| Query against `silver.v_latest_observation` | Rows |
+|---|---|
+| `platform = 'Blinkit' AND brand = 'Mr. Munchies'` | **0** |
+| `platform = 'blinkit' AND brand = 'Mr. Munchies'` | **1**, `in_stock_rate_pct = 7.60` (GT 7.6) |
+
+The same queries also invented filters the question did not ask for
+(`availability = true`, `product_name ILIKE '%Mr. Munchies%'` to filter a
+brand) and used `city = 'Bangalore'` where the data stores `'Bengaluru'`.
+
+A second, related defect surfaced in the post-fix check: exact
+`product_name = 'Mr. Munchies Cheese Chilli Samosa'` matched nothing because the
+stored name is `'Mr. Munchies Cheese Chilli Samosa (Frozen)'`.
+
+**Fix:** `src/prompts/sql_planner.md` now lists the exact literal values
+(`platform` lowercase, `source_type`, the 11 city spellings, brand examples),
+states that `delivery_eta_minutes` is always NULL, tells the planner to match
+products with `product_name ILIKE '%<distinctive words>%'`, and forbids adding
+filters the question did not ask for.
+
+**Verified (6/6):** N26, N01, N34, N07, N33 and D03 all pass — lowercase
+`'blinkit'`, rows returned, ground-truth value present in the answer, D03
+citing `metrics/status_vocabulary.md`. The four-route API smoke test passes with
+`router_error` unset.
+
+**Caveat:** `openai/gpt-oss-120b` exhausted its 200,000-token daily cap during
+the baseline, so the post-fix spot check ran on a temporary `:8001` server with
+the three `LLM_*_MODEL` env vars set to `openai/gpt-oss-20b` (separate quota).
+Code, prompts, DB and index were unchanged. A full 75-question re-run on 120b is
+still pending.
+
+**Operational note:** the Groq API key was exposed in a terminal transcript
+during this session (a `Get-Content .env` filter matched `LLM_API_KEY`). Rotate
+it in the Groq console and update `.env` before the next long run. Never print
+`.env`; filter on specific non-secret keys only.
 
 
 

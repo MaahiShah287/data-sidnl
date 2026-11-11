@@ -27,6 +27,7 @@ from db.client import close_pool                 # noqa: E402
 
 ROWS_PER_DOC = 25          # group rows into chunks of N to keep docs readable
 EMBED_BATCH = 64           # rows per embedding call
+ADD_BATCH = 256            # documents per Chroma write (see Error 4 in HANDOFF.md)
 VIEWS = [
     "silver.v_all_platforms",
     "silver.v_latest_observation",
@@ -106,10 +107,56 @@ def collect_all_documents() -> list[dict]:
     return all_docs
 
 
+def _docs_fingerprint(docs: list[dict], model_name: str) -> str:
+    """Stable hash of the corpus + model, so a checkpoint is never reused wrongly."""
+    import hashlib
+
+    h = hashlib.sha1()
+    h.update(model_name.encode())
+    for d in docs:
+        h.update(d["id"].encode())
+        h.update(b"\0")
+        h.update(d["text"].encode())
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+def embed_with_checkpoint(docs: list[dict], model_name: str):
+    """
+    Embed the row documents, reusing a cached array when the corpus is unchanged.
+
+    A full rebuild costs ~5.5 h of CPU and the expensive part is model.encode,
+    not the Chroma write. Embeddings are saved under reports/embed_cache/
+    (git-ignored) and reused, so a failed write does not cost the encode again.
+    """
+    import numpy as np
+    from sentence_transformers import SentenceTransformer
+
+    cache_dir = PROJECT_ROOT / "reports" / "embed_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / f"rows-{_docs_fingerprint(docs, model_name)}.npy"
+
+    if cache.exists():
+        cached = np.load(cache)
+        if cached.shape[0] == len(docs):
+            print(f"Reusing cached embeddings {cache.name} "
+                  f"({cached.shape[0]} x {cached.shape[1]}), skipping encode")
+            return cached
+        print(f"Ignoring {cache.name}: {cached.shape[0]} rows != {len(docs)} docs")
+
+    print(f"Loading embedding model '{model_name}' ...")
+    model = SentenceTransformer(model_name)
+    texts = [d["text"] for d in docs]
+    print(f"Embedding {len(texts)} documents (batch {EMBED_BATCH}) ...")
+    embeddings = model.encode(texts, batch_size=EMBED_BATCH, show_progress_bar=True)
+    np.save(cache, embeddings)
+    print(f"Saved embeddings checkpoint {cache.name} ({embeddings.shape[0]} rows)")
+    return embeddings
+
+
 def write_to_chroma(docs: list[dict]) -> None:
     import chromadb
     from chromadb.config import Settings as ChromaSettings
-    from sentence_transformers import SentenceTransformer
 
     client = chromadb.PersistentClient(
         path=settings.chroma_persist_dir,
@@ -128,22 +175,23 @@ def write_to_chroma(docs: list[dict]) -> None:
         metadata={"hnsw:space": "cosine"},
     )
 
-    print(f"Loading embedding model '{settings.embedding_model}' ...")
-    model = SentenceTransformer(settings.embedding_model)
-
+    embeddings = embed_with_checkpoint(docs, settings.embedding_model)
     texts = [d["text"] for d in docs]
-    print(f"Embedding {len(texts)} documents (batch {EMBED_BATCH}) ...")
-    embeddings = model.encode(
-        texts, batch_size=EMBED_BATCH, show_progress_bar=True
-    ).tolist()
 
-    collection.add(
-        ids=[d["id"] for d in docs],
-        documents=texts,
-        metadatas=[d["metadata"] for d in docs],
-        embeddings=embeddings,
-    )
-    print(f"Wrote {len(docs)} documents to '{settings.chroma_collection_name}' "
+    # Write in batches. A single add() of ~3.8k docs can raise a post-write
+    # "Error in compaction" even though the data lands (HANDOFF.md Error 4);
+    # batching keeps each transaction small and makes progress visible.
+    total = len(docs)
+    for start in range(0, total, ADD_BATCH):
+        end = min(start + ADD_BATCH, total)
+        collection.add(
+            ids=[d["id"] for d in docs[start:end]],
+            documents=texts[start:end],
+            metadatas=[d["metadata"] for d in docs[start:end]],
+            embeddings=embeddings[start:end].tolist(),
+        )
+        print(f"  wrote {end}/{total}")
+    print(f"Wrote {total} documents to '{settings.chroma_collection_name}' "
           f"at '{settings.chroma_persist_dir}'")
 
     # Documentation corpus (metric dictionary + docs/*.md) so DEFINITION

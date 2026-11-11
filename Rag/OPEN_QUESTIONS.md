@@ -71,6 +71,14 @@ for a different question.
   3. **Both**: keep ~8 as `expect_no_data` honesty tests, rewrite the rest, and
      add ~10 new answerable questions.
   Do NOT change this silently — it moves the baseline.
+- [RESOLVED 2026-11-11] **Option 3 chosen (user-approved).**
+  `eval/questions.jsonl` now has 75 questions: 37 NUMERIC (25 slots + N26–N35
+  new answerable), 8 `expect_no_data` honesty tests, 27 answerable overall,
+  38 non-numeric. Every SQL-bearing question has an explicit `primary_column`
+  so `run_ground_truth.py` stops reporting `listing_count` instead of the
+  metric. All 35 SQL questions execute; the 8 coverage gaps return 0 rows.
+  `eval/run_eval.py` scores `no_data_correct`. See `HANDOFF.md` → "Eval
+  rewrite" for the full rationale.
 - [FACT] `N16` = 1 and `N20` = 86.6 are numbers for **Mumbai**, not the cities
   the questions name; they must be discarded, not "verified".
 

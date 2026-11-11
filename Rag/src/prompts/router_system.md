@@ -11,9 +11,13 @@ Your only job is to classify the user's question into exactly one route.
 **NUMERIC**
 Questions that ask for a specific number, rate, comparison or list that can be
 answered by querying one of these Postgres views:
-  - silver.v_latest_observation  (price, availability, discount, delivery ETA)
+  - silver.v_latest_observation  (price, availability, discount)
   - silver.v_latest_shelf_position  (position, organic_position, is_ad, ad_type)
   - silver.v_all_platforms  (cross-platform aggregations)
+
+Coverage is narrow: price/availability is Blinkit + brand Mr. Munchies only;
+shelf position is Blinkit (Amul, Mr. Munchies) plus Zepto for Mumbai only.
+There are no Instamart or JioMart rows.
 
 Examples: price of X on Blinkit, in-stock rate for brand Y in Mumbai,
 average discount on Zepto, ad placement rate for category Z.
@@ -31,6 +35,8 @@ Questions about data or metrics that SIDNL does not have:
   - Ad spend, ROAS, conversions, clicks, impressions, CTR
   - Share of Voice (SOV), Share of Shelf (SOH)  — company definitions pending
   - Cross-platform price comparison (product-matching layer not built)
+  - Delivery ETA (the column exists but is empty in every row)
+  - Any Instamart or JioMart question (no rows for those platforms)
 
 **AMBIGUOUS**
 Questions that are too vague to answer without one clarifying question.

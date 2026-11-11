@@ -37,6 +37,31 @@ def _numbers_in_text(text: str) -> set[float]:
     return {float(m) for m in matches}
 
 
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?\b")
+_COUNT_RE = re.compile(r"\b\d+\s+(?:rows?|results?|records?)\b", re.IGNORECASE)
+_DRAFT_RE = re.compile(r"^\s*(?:draft|warning:?\s*draft)\s+(?:metric|definition)\s*:", re.IGNORECASE)
+
+
+def _scoring_numbers(text: str) -> set[float]:
+    """
+    Numbers a NUMERIC answer is actually claiming as data.
+
+    Strips things that are not metric values: fenced SQL, dates/timestamps,
+    "N rows/results" bookkeeping, and the verbatim draft definition banner
+    (which can contain constants such as "* 100"). Without this, a correct
+    answer is flagged as a hallucination because it states the row count.
+    """
+    cleaned = _FENCE_RE.sub(" ", text or "")
+    cleaned = "\n".join(
+        line for line in cleaned.splitlines()
+        if not _DRAFT_RE.match(line)
+    )
+    cleaned = _DATE_RE.sub(" ", cleaned)
+    cleaned = _COUNT_RE.sub(" ", cleaned)
+    return _numbers_in_text(cleaned)
+
+
 def _in_rows(val: float, rows: list[dict], tol: float = 0.005) -> bool:
     for row in rows:
         for rv in row.values():
@@ -86,7 +111,7 @@ def score_response(question_rec: dict, resp: dict | None, exception: str | None)
 
     # Numeric grounding: every number in answer must be in rows
     if expected_route == "NUMERIC" and not expect_abstain and not expect_no_data and rows:
-        nums = _numbers_in_text(actual_answer)
+        nums = _scoring_numbers(actual_answer)
         if nums:
             ungrounded = [n for n in nums if not _in_rows(n, rows)]
             scores["numeric_grounded"] = len(ungrounded) == 0
@@ -101,7 +126,7 @@ def score_response(question_rec: dict, resp: dict | None, exception: str | None)
     # Numeric correctness against ground truth
     gt_val = question_rec.get("ground_truth_value")
     if gt_val is not None and expected_route == "NUMERIC" and not expect_no_data:
-        answer_nums = _numbers_in_text(actual_answer)
+        answer_nums = _scoring_numbers(actual_answer)
         try:
             gt_f = float(gt_val)
             scores["numeric_correct"] = any(
