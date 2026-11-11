@@ -72,7 +72,8 @@ comment on view dash.v_workspace_ads is
 create or replace view dash.v_workspace_sov_keyword
 with (security_invoker = true) as
 select w.workspace_id, w.brand_name,
-       s.period_start, s.period_end, s.keyword, s.searches, s.sov_pct, s.loaded_at
+       s.period_start, s.period_end, s.target_value as keyword,
+       s.searches, s.sov_pct, s.loaded_at
 from silver.fact_fp_ads s
 join dash.cfg_workspace_map w
   on w.platform = 'blinkit'
