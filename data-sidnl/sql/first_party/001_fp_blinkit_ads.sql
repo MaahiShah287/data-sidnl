@@ -226,12 +226,12 @@ begin
   get diagnostics v_rows = row_count;
   insert into dash.refresh_table_state(table_name, last_refreshed_at, row_count,
     last_attempt_at, last_status)
-  values ('ads', now(), (select count(*) from dash.ads), now(), 'ok')
+  values ('ads', now(), (select count(*) from dash.ads), now(), 'success')
   on conflict (table_name) do update
     set last_refreshed_at = now(), row_count = (select count(*) from dash.ads),
-        last_attempt_at = now(), last_status = 'ok', last_error = null;
+        last_attempt_at = now(), last_status = 'success', last_error = null;
 
-  return jsonb_build_object('status','ok','rows', (select count(*) from dash.ads),
+  return jsonb_build_object('status','success','rows', (select count(*) from dash.ads),
                             'ms', round(extract(epoch from clock_timestamp()-v_t0)*1000));
 exception when others then
   insert into dash.refresh_table_state(table_name, last_attempt_at, last_status, last_error)
