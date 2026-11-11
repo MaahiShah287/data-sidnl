@@ -6,7 +6,8 @@ and keeps the repo's schema files identical to the live database.
     python sidnl.py report                 health, data quality, freshness, reconciliation, dead letters
     python sidnl.py run [--force]          run bronze -> silver now (what cron does every minute)
     python sidnl.py refresh --brand NAME   reload one client brand
-    python sidnl.py test                   in-database self-tests (parser, matcher, quality checks)
+    python sidnl.py test                   in-database self-test suite (silver.selftest: parser, dq, matcher, integrity)
+    python sidnl.py dry-run FILE...        run migrations in one transaction, measure their effect, roll everything back
     python sidnl.py export-schema          regenerate sql/01..03 and sql/manifest.csv from the live database
     python sidnl.py verify                 fail if the repo's sql files differ from the live database
 
@@ -14,14 +15,19 @@ Connection: environment variable SUPABASE_DB_URL (Supabase > Connect > Session p
 """
 import argparse
 import csv
+import hashlib
 import io
 import json
+import logging
 import os
 import pathlib
 import sys
+import time
 
+log = logging.getLogger("sidnl")
 ROOT = pathlib.Path(__file__).resolve().parent
 SQL_DIR = ROOT / "sql"
+PENDING_DIR = SQL_DIR / "pending"
 SCHEMA_FILES = {
     "tables": SQL_DIR / "01_tables.sql",
     "functions": SQL_DIR / "02_functions.sql",
@@ -33,21 +39,44 @@ MANIFEST = SQL_DIR / "manifest.csv"
 # --------------------------------------------------------------------------------------------------------------------
 # connection
 # --------------------------------------------------------------------------------------------------------------------
-def connect():
+def _open(url):
+    try:
+        import psycopg
+        return psycopg.connect(url, prepare_threshold=None, autocommit=False, application_name="sidnl",
+                               connect_timeout=15)
+    except ImportError:  # psycopg binary blocked on some machines; psycopg2 works the same for this tool
+        import psycopg2
+        return psycopg2.connect(url, application_name="sidnl", connect_timeout=15)
+
+
+def connect(attempts=4):
+    """Connect, retrying transient failures (pooler restarts, network blips) after 2, 4, 8 s."""
     try:
         url = os.environ["SUPABASE_DB_URL"]
     except KeyError:
         raise SystemExit("Set SUPABASE_DB_URL (Supabase > Connect > Session pooler). Do not put it in a file.")
-    try:
-        import psycopg
-        conn = psycopg.connect(url, prepare_threshold=None, autocommit=False, application_name="sidnl")
-    except ImportError:  # psycopg binary blocked on some machines; psycopg2 works the same for this tool
-        import psycopg2
-        conn = psycopg2.connect(url, application_name="sidnl")
+    for attempt in range(1, attempts + 1):
+        try:
+            conn = _open(url)
+            break
+        except Exception as e:  # OperationalError of either driver; auth errors fail the same way every time
+            msg = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+            if attempt == attempts or "password authentication failed" in msg:
+                raise SystemExit(f"could not connect after {attempt} attempt(s): {msg}")
+            wait = 2 ** attempt
+            log.warning("connect attempt %d failed (%s); retrying in %d s", attempt, msg, wait)
+            time.sleep(wait)
     with conn.cursor() as cur:
         cur.execute("set statement_timeout = 0")
     conn.commit()
     return conn
+
+
+def exists(conn, regclass_or_func):
+    """True when a relation (`schema.name`) or function (`schema.name()`) exists."""
+    if regclass_or_func.endswith(")"):
+        return one(conn, "select to_regprocedure(%s) is not null", (regclass_or_func,))
+    return one(conn, "select to_regclass(%s) is not null", (regclass_or_func,))
 
 
 def one(conn, sql, params=None):
@@ -87,6 +116,14 @@ def cmd_report(conn, _a):
                                      "from ops.v_dead_letter_summary order by 1, 2, 3, 4"))
     show("cron jobs", *rows(conn, "select jobname, active, runs_24h, failures_24h, consecutive_failures "
                                   "from ops.v_cron_health order by 1"))
+    if exists(conn, "silver.fact_scrape_run"):
+        show("scrape context (silver_070): last load", *rows(conn,
+             "select run_id, started_at, status, stats - 'failed_sections' as rows, stats -> 'failed_sections' as failed "
+             "from ops.etl_run where brand_key = '_context' order by run_id desc limit 1"))
+        show("collection health, last 3 days (dash_011)", *rows(conn,
+             "select obs_date, platform, job_type, runs, runs_failed, store_completion_pct, blocked "
+             "from dash.collection_health where obs_date >= current_date - 3 order by 1 desc, 2, 3"))
+    conn.rollback()
 
 
 def cmd_run(conn, a):
@@ -102,15 +139,107 @@ def cmd_refresh(conn, a):
     print(json.dumps(stats, indent=2, default=str))
 
 
+def run_selftest(conn):
+    """[(suite, test, ok, detail)] from silver.selftest(); falls back to the pre-silver_071 functions."""
+    if exists(conn, "silver.selftest()"):
+        return rows(conn, "select suite, test, ok, detail from silver.selftest()")[1]
+    out = [("parser", "selftest_parser", None, one(conn, "select silver.selftest_parser()"))]
+    out[0] = (*out[0][:2], out[0][3] == "all parser tests passed", out[0][3])
+    out += rows(conn, "select 'matcher', test, ok, detail from silver.selftest_matcher()")[1]
+    out += rows(conn, "select 'integrity', check_name, ok, detail from silver.quality_checks() "
+                      "where check_name <> 'parser_selftest' and check_name not like 'matcher_selftest:%'")[1]
+    return out
+
+
 def cmd_test(conn, _a):
-    print(one(conn, "select silver.selftest_parser()"))
-    bad = one(conn, "select count(*) from silver.selftest_matcher() t where not t.ok")
-    print(f"matcher self-test failures: {bad}")
-    failed = one(conn, "select coalesce(json_agg(t.check_name), '[]') from silver.quality_checks() t where not t.ok")
-    print(f"quality checks failed: {failed}")
+    t0 = time.perf_counter()
+    results = run_selftest(conn)
     conn.rollback()
-    if bad or (failed not in ([], "[]")):
+    for suite, test, ok, detail in results:
+        print(f"  {'ok  ' if ok else 'FAIL'} {suite:10s} {test}" + ("" if ok else f"\n         {detail}"))
+    bad = [r for r in results if not r[2]]
+    print(f"{len(results) - len(bad)}/{len(results)} passed in {time.perf_counter() - t0:.1f} s")
+    if bad:
         raise SystemExit(1)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# dry run: apply migrations inside one transaction, measure, roll back (README "Changing the database", step 2)
+# --------------------------------------------------------------------------------------------------------------------
+IMPACT_SQL = [
+    ("failed / incomplete reads in silver (rows flagged by silver_069 backfill)",
+     "select silver.backfill_read_flags(2000000)", "silver.backfill_read_flags(integer)"),
+    ("readings by read state after silver_069",
+     "select coalesce(read_status, '(product check)') as read_status, read_complete, dq_status, count(*) "
+     "from silver.fact_product_reading group by 1, 2, 3 order by 1, 2, 3", "silver.backfill_read_flags(integer)"),
+    ("shelf rows of incomplete reads",
+     "select dq_status, stock_status, count(*) from silver.fact_shelf_position where shelf_complete is false "
+     "group by 1, 2 order by 1, 2", "silver.backfill_read_flags(integer)"),
+    ("silver context load (silver_070)", "select silver.refresh_scrape_context()", "silver.refresh_scrape_context()"),
+    ("dash context tables (dash_011)", "select dash.refresh_context()", "dash.refresh_context()"),
+    ("row counts of the new tables",
+     "select 'fact_shelf_snapshot' t, count(*) from silver.fact_shelf_snapshot union all "
+     "select 'fact_scrape_run', count(*) from silver.fact_scrape_run union all "
+     "select 'fact_serviceability', count(*) from silver.fact_serviceability union all "
+     "select 'dim_sample_point', count(*) from silver.dim_sample_point union all "
+     "select 'dim_listing', count(*) from silver.dim_listing union all "
+     "select 'dim_catalog_product', count(*) from silver.dim_catalog_product union all "
+     "select 'dash.coverage', count(*) from dash.coverage union all "
+     "select 'dash.collection_health', count(*) from dash.collection_health", "dash.refresh_context()"),
+]
+
+
+def pending_files():
+    """Migrations not yet applied, in the order of sql/pending/ORDER (dash_* depend on silver_*)."""
+    order = PENDING_DIR / "ORDER"
+    if not order.exists():
+        return []
+    names = [ln.strip() for ln in order.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
+    return [PENDING_DIR / n for n in names]
+
+
+def timed(conn, sql, repeat=3):
+    best = None
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            cur.fetchall()
+        dt = time.perf_counter() - t0
+        best = dt if best is None else min(best, dt)
+    return best
+
+
+def cmd_dry_run(conn, a):
+    files = [pathlib.Path(f) for f in a.files] or pending_files()
+    with conn.cursor() as cur:
+        cur.execute("set lock_timeout = '15s'")   # never queue behind a running pipeline for long
+    gate_before = timed(conn, "select * from silver.dq_checks()")
+    selftest_before = timed(conn, "select * from silver.selftest_parser()", repeat=1)
+    try:
+        for f in files:
+            text = f.read_text(encoding="utf-8").replace("\r\n", "\n")
+            t0 = time.perf_counter()
+            with conn.cursor() as cur:
+                cur.execute(text)
+            print(f"applied  {f.name}  md5={hashlib.md5(text.encode()).hexdigest()}  {time.perf_counter() - t0:.1f} s")
+        for title, sql, needs in IMPACT_SQL:
+            if not exists(conn, needs):
+                continue
+            t0 = time.perf_counter()
+            cols, data = rows(conn, sql)
+            show(f"{title}  ({time.perf_counter() - t0:.1f} s)", cols, data)
+        gate_after = timed(conn, "select * from silver.dq_checks()")
+        print(f"-- quality gate silver.dq_checks(): {gate_before:.2f} s before, {gate_after:.2f} s after (best of 3)")
+        results = run_selftest(conn)
+        bad = [r for r in results if not r[2]]
+        print(f"-- self-test after migration: {len(results) - len(bad)}/{len(results)} passed "
+              f"(selftest_parser before: {selftest_before:.2f} s)")
+        for suite, test, _ok, detail in bad:
+            print(f"  FAIL {suite} {test}: {detail}")
+    finally:
+        conn.rollback()
+        print("rolled back: the database is unchanged")
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -332,10 +461,13 @@ def main(argv=None):
     r = sub.add_parser("run"); r.add_argument("--force", action="store_true")
     f = sub.add_parser("refresh"); f.add_argument("--brand", required=True)
     sub.add_parser("test")
+    d = sub.add_parser("dry-run", help="default: every migration in sql/pending, in name order")
+    d.add_argument("files", nargs="*")
     sub.add_parser("export-schema")
     sub.add_parser("verify")
     a = ap.parse_args(argv)
-    fn = {"report": cmd_report, "run": cmd_run, "refresh": cmd_refresh, "test": cmd_test,
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+    fn = {"report": cmd_report, "run": cmd_run, "refresh": cmd_refresh, "test": cmd_test, "dry-run": cmd_dry_run,
           "export-schema": cmd_export, "verify": cmd_verify}[a.cmd]
     conn = connect()
     try:

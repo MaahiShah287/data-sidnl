@@ -23,8 +23,10 @@ ops     run history, quality results, alerts, checks       (ops.*)
 | `sql/03_views_jobs_config.sql` | views, grants, configuration rows, the pg_cron jobs |
 | `sql/rollbacks.sql` | the rollback for each migration since `silver_041` (undo newest first) |
 | `sql/manifest.csv` | every applied migration: version, name, md5 of the applied SQL |
+| `sql/pending/` | migrations written but **not yet applied** (apply order in `ORDER`, rollbacks in `rollbacks_pending.sql`); see [docs/PIPELINE_STATUS_2026-11-11.md](docs/PIPELINE_STATUS_2026-11-11.md) |
 | `sidnl.py` | command line (below) |
 | `tests/test_live_db.py` | tests against the live database (skipped without `SUPABASE_DB_URL`) |
+| `tests/test_offline.py` | tests that need no database: bronze→silver column contract, pending migrations (rollback, preflight, parse), CLI retry |
 | `portal/` | Next.js dashboard reading `dash.*` |
 
 `sql/01..03` are **generated** from the live database (`python sidnl.py export-schema`) and checked by
@@ -36,7 +38,8 @@ every migration ever applied is kept by Supabase in `supabase_migrations.schema_
 pip install -r requirements.txt
 export SUPABASE_DB_URL='postgresql://...'      # Supabase > Connect > Session pooler. Never commit it.
 python sidnl.py report                          # health, gold refresh, freshness, reconciliation, dead letters, cron
-python sidnl.py test                            # in-database self-tests (parser, matcher, quality checks)
+python sidnl.py test                            # in-database self-test suite (silver.selftest once silver_071 is applied)
+python sidnl.py dry-run                         # apply sql/pending/* in one transaction, print effect + timings, roll back
 python sidnl.py run [--force]                   # run bronze -> silver now (cron does this every minute)
 python sidnl.py verify                          # repo sql/ == live database?
 python -m unittest discover -s tests -v
@@ -114,7 +117,8 @@ The daily job now uses `silver.enqueue_daily_safe`, which cannot time out on the
 
 ## Changing the database (the only way)
 1. Write a migration `silver_NNN_slug` / `dash_NNN_slug`.
-2. Dry run it inside a transaction that is rolled back (end the script with a `raise exception` that prints the results).
+2. Dry run it inside a transaction that is rolled back: put it in `sql/pending/` + `ORDER` and run `python sidnl.py dry-run`
+   (or end the script with a `raise exception` that prints the results).
 3. Apply with Supabase `apply_migration`; check that `md5(array_to_string(statements, E'\n'))` equals the md5 of your file.
 4. Append its rollback to `sql/rollbacks.sql`.
 5. `python sidnl.py export-schema`, then `python sidnl.py verify`, then commit and push to `main`.

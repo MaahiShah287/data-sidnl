@@ -32,25 +32,14 @@ class LiveDb(unittest.TestCase):
         self.cur.close()
         self.conn.close()
 
-    # ---------------------------------------------------------------- smoke
-    def test_parser_selftest(self):
-        self.assertEqual(scalar(self.cur, "select silver.selftest_parser()"), "all parser tests passed")
-
-    def test_matcher_selftest(self):
-        self.assertEqual(scalar(self.cur, "select count(*) from silver.selftest_matcher() t where not t.ok"), 0)
-
-    def test_quality_checks(self):
-        self.assertEqual(scalar(self.cur, "select count(*) from silver.quality_checks() t where not t.ok"), 0)
-
-    def test_every_row_has_a_sidnl_id(self):
-        for table in ("dim_product", "fact_product_reading", "fact_shelf_position"):
-            n = scalar(self.cur, f"select count(*) from silver.{table} t "
-                                 "left join silver.product_xref x using (product_key) where x.sidnl_id is null")
-            self.assertEqual(n, 0, f"{table} has rows without a sidnl_id")
-
-    def test_all_cron_jobs_active(self):
-        n = scalar(self.cur, "select count(*) from cron.job where jobname like 'sidnl-%' and not active")
-        self.assertEqual(n, 0)
+    # ---------------------------------------------------------------- the in-database suite (silver_071)
+    # One call covers parser, dq rules, matcher, SI-id integrity, the failed-read rule, the personal-data guard and
+    # the cron jobs (it replaced 5 tests here that re-ran the same database checks). Every failure is listed.
+    def test_selftest_suite(self):
+        results = sidnl.run_selftest(self.conn)
+        failed = [f"{s}/{t}: {d}" for s, t, ok, d in results if not ok]
+        self.assertGreater(len(results), 0)
+        self.assertEqual(failed, [], "\n".join(failed))
 
     # ---------------------------------------------------------------- bronze -> silver -> dash
     def test_reconciliation_latest_ok(self):

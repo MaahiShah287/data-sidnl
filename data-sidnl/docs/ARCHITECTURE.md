@@ -135,6 +135,15 @@ latest per check in `ops.v_reconciliation_latest`. Any mismatch writes an alert 
 Alert rows today (all in `ops.cron_alert_log`): cron failures (3 in a row), `freshness:<platform>/<source>`,
 `sidnl-reconcile:data`, `sidnl-reconcile:coverage`, `dead-letter:<scope>`; storage levels in `ops.storage_alert_log`.
 
+## 7a. Pending (written 2026-11-11, not yet applied; `sql/pending/`)
+`silver_069` bronze column contract (new reading / scan columns, `pages_read`, `dim_city.center_*` and the stray
+`dim_store` weight column removed; a failed or incomplete read never yields out_of_stock). `silver_070` new silver
+tables `fact_shelf_snapshot`, `fact_scrape_run`, `fact_serviceability`, `dim_sample_point`, `dim_listing`,
+`dim_catalog_product` (loader `silver.refresh_scrape_context()`, isolated sections). `dash_011` `dash.coverage`,
+`dash.collection_health`, cron `sidnl-context` (every 10 min). `silver_071` one self-test suite `silver.selftest()`.
+`silver_072` quality gate reads the processing window (knob `dq_gate_window`). Details, bottlenecks and roadmap:
+[PIPELINE_STATUS_2026-11-11.md](PIPELINE_STATUS_2026-11-11.md). Move this into the sections above once applied.
+
 ## 8. Known limits
 - Gold rebuilds dash in full (~40 s today). At much larger volume it needs an incremental refresh keyed by a stable id.
 - 10,787 bronze stock checks of non-client brands are outside `silver.brand_scope` and not loaded.
