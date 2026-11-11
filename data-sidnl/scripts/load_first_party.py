@@ -261,13 +261,21 @@ def main():
                 print(f"[error] {path.name}: {exc}")
                 continue
 
+            # ownership: source portal account id comes from the export filename
+            # (e.g. '791_Search_Reports_...', 'sponsored_sov_791_...').
+            # Files without it (Report_...) carry account_id = null; the mapping
+            # in dash.cfg_workspace_account decides ownership downstream.
+            account_id = "791" if "791" in path.name else None
+            for r in rows:
+                r["account_id"] = account_id
+
             cols = ["report_type","obs_date","period_start","period_end","campaign_id",
                     "campaign_name","subcampaign_id","ad_type","target_type","target_value",
                     "match_type","pacing_type","most_viewed_position","cpm","total_budget",
                     "impressions","direct_atc","indirect_atc","new_users","direct_sales",
                     "indirect_sales","direct_qty","indirect_qty","budget_consumed",
                     "direct_roas","total_roas","searches","sov_pct","claimables",
-                    "served_budget"]
+                    "served_budget","account_id"]
             insert_count = 0
             for r in rows:
                 r["raw"] = json.dumps({k: (str(v) if isinstance(v, (date, datetime, Decimal)) else v)
