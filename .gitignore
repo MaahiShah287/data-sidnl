@@ -1,1 +1,4 @@
 Claude outputs/
+
+# First-party portal exports (company data, never commit)
+/first_party/

@@ -22,3 +22,6 @@ rag/.env.*
 # Local LLM outputs
 Claude outputs/
 
+
+# First-party portal exports (company data, never commit)
+/first_party/
