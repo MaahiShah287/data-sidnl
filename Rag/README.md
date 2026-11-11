@@ -39,7 +39,7 @@ Run everything with `.\.venv\Scripts\python.exe` from `Rag/`.
 
 A full rebuild can exit non-zero with a Chroma "Error in compaction" message
 *after* the write succeeded — check `collection.count()` before rebuilding
-again (see `HANDOFF.md` Error 4).
+again (see `RAG_PIPELINE_DOCUMENTATION.md` §13).
 
 ## Run the API
 
@@ -57,4 +57,5 @@ again (see `HANDOFF.md` Error 4).
 - `eval/` — evaluation harness and question set
 - `metrics/metric_dictionary.yaml` — metric definitions/status
 
-See `HANDOFF.md` for current state and `OPEN_QUESTIONS.md` for open data questions.
+See `RAG_PIPELINE_DOCUMENTATION.md` for how the pipeline works and
+`OPEN_QUESTIONS.md` for open data questions.

@@ -77,8 +77,8 @@ for a different question.
   38 non-numeric. Every SQL-bearing question has an explicit `primary_column`
   so `run_ground_truth.py` stops reporting `listing_count` instead of the
   metric. All 35 SQL questions execute; the 8 coverage gaps return 0 rows.
-  `eval/run_eval.py` scores `no_data_correct`. See `HANDOFF.md` → "Eval
-  rewrite" for the full rationale.
+  `eval/run_eval.py` scores `no_data_correct`. See
+  `RAG_PIPELINE_DOCUMENTATION.md` §10 for the full rationale.
 - [FACT] `N16` = 1 and `N20` = 86.6 are numbers for **Mumbai**, not the cities
   the questions name; they must be discarded, not "verified".
 

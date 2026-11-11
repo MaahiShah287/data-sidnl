@@ -27,7 +27,7 @@ from db.client import close_pool                 # noqa: E402
 
 ROWS_PER_DOC = 25          # group rows into chunks of N to keep docs readable
 EMBED_BATCH = 64           # rows per embedding call
-ADD_BATCH = 256            # documents per Chroma write (see Error 4 in HANDOFF.md)
+ADD_BATCH = 256            # documents per Chroma write (see RAG_PIPELINE_DOCUMENTATION.md, section 13)
 VIEWS = [
     "silver.v_all_platforms",
     "silver.v_latest_observation",
@@ -179,7 +179,8 @@ def write_to_chroma(docs: list[dict]) -> None:
     texts = [d["text"] for d in docs]
 
     # Write in batches. A single add() of ~3.8k docs can raise a post-write
-    # "Error in compaction" even though the data lands (HANDOFF.md Error 4);
+    # "Error in compaction" even though the data lands (see
+    # RAG_PIPELINE_DOCUMENTATION.md, section 13);
     # batching keeps each transaction small and makes progress visible.
     total = len(docs)
     for start in range(0, total, ADD_BATCH):
