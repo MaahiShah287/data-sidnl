@@ -2,16 +2,19 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
-  LayoutDashboard, TrendingUp, Package, Tag, CheckCircle,
-  Eye
+  LayoutDashboard, TrendingUp, Tag, CheckCircle,
+  Eye, Swords, Megaphone, ListChecks
 } from 'lucide-react';
 import clsx from 'clsx';
 
 const NAV = [
-  { href: '/',              label: 'Overview',      icon: LayoutDashboard },
-  { href: '/availability', label: 'Availability',  icon: CheckCircle },
-  { href: '/pricing',      label: 'Pricing',       icon: Tag },
-  { href: '/visibility',   label: 'Visibility',    icon: Eye },
+  { href: '/',              label: 'Overview',        icon: LayoutDashboard },
+  { href: '/availability', label: 'Availability',    icon: CheckCircle },
+  { href: '/pricing',      label: 'Pricing',         icon: Tag },
+  { href: '/visibility',   label: 'Visibility',      icon: Eye },
+  { href: '/competitors',  label: 'Competitors',     icon: Swords },
+  { href: '/ads',          label: 'Ads',             icon: Megaphone },
+  { href: '/metrics',      label: 'Metric coverage', icon: ListChecks },
 ];
 
 export default function Sidebar() {

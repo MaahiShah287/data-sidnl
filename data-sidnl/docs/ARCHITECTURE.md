@@ -147,6 +147,58 @@ dash.ads / dash.ads_campaign_period / dash.ads_keyword_sov
   tables. Example: `select obs_date, sum(ad_spend), sum(attributed_sales), round(sum(attributed_sales)/nullif(sum(ad_spend),0),2)
   from dash.ads where report_level = 'campaign' group by 1 order by 1;`
 
+## 5b. Competitor layer (`dash_013`) and bronze drift fix (`silver_075`)
+Applied 2026-11-13 (versions `20261113062816` and `20261113062951`; SQL in `sql/migrations/`, rollbacks in `sql/rollbacks.sql`).
+- **`silver_075`**: the scraper schema dropped `public.platform_listings.brand`; `silver.refresh_brand_strings` and
+  `silver.refresh_brand` still read it, so every silver run since 2026-11-11 died in stage `discover`
+  (`column "brand" does not exist`, 549 failed jobs in 24 h, gold last refreshed 2026-11-11 06:45 UTC, 415 k bronze rows
+  behind). The fix reads the column through `to_jsonb(pl) ->> 'brand'` (NULL when absent, the real value if it returns), the brand
+  still comes from `public.products.brand`. Applying it let the discover stage pass again: `register_category_scopes`
+  registered the Zepto "Veg Snacks" shelf (read at >= 10 stores) and its 41 k shelf rows (McCain, HyFun, ITC Master Chef,
+  Godrej Yummiez, Mr. Munchies ...) were loaded on 2026-11-13.
+- **`silver_076` (applied 2026-11-13 06:57 UTC, version `20261113065733`)**: the same drift also hit `silver.refresh_brand`: its `_listings`
+  temp table read `platform_listings.name / pack_size / image_url`, which moved to `public.platform_products` (name, pack, image_url). It now
+  joins `platform_products`. Run 1681 (07:00-07:02) was the first `success` since 2026-11-11 (all three client brands refreshed, gold
+  refreshed 07:02): dash.availability 65,740 rows, pricing 1,227, visibility 45,058, Mr. Munchies on Zepto 7 products / 3.7 k stock readings.
+  `silver.refresh_scrape_context` (cron `sidnl-context`) still reads dropped `platform_listings` columns (name, brand, pack_size, details):
+  a separate failure, not yet fixed. `ops.v_silver_health` keeps showing `degraded` until the 24 h failure window passes.
+- **`dash_013`**: a competitor is any brand on a category shelf where a client brand is listed (Mr. Munchies = Blinkit "Frozen
+  Veg Snacks", 40 brands, 944 stores, 11 cities). `dash.refresh_competitors()` (cron `sidnl-competitors`, every 10 min, same pattern as
+  `dash.refresh_ads`) rebuilds `dash.comp_sku_day` (SKU x city x day: median SP/MRP, discount, price per 100 g|ml, OSA, listing
+  stores, rank, price change vs previous scrape; the SI id is resolved live in `v_comp_sku_day`, see 5c) and `dash.comp_brand_day` (brand x category x city|ALL x day: share of
+  shelf, avg rank, top-10 rate, paid share, OSA, listing %, avg discount, median unit price; every % stored with numerator and
+  denominator). Views `dash.v_comp_price_gap` (client brand vs each competitor, normalised unit price) and
+  `dash.v_comp_cross_marketplace` (same SI id on two platforms). Share of shelf is a **proxy** for share of voice / market share;
+  price gaps are brand-level until a verified SKU match table exists.
+- Portal: `/competitors`, `/ads`, `/metrics` (coverage of the 171 handbook metrics, from `scripts/metric_coverage.py`) and a
+  platform / brand filter (`?platform=zepto&brand=mr munchies`) on Overview, Availability, Pricing, Visibility. The competitor page
+  shows "tables not created yet" if `dash_013` is ever rolled back. The portal needs `DATABASE_URL` (not in `portal/.env.local`).
+- First fill 2026-11-13: `comp_sku_day` 15,496 rows, `comp_brand_day` 2,988 rows (Blinkit); after a manual `dash.refresh_competitors()` at 06:43 UTC
+  16,321 / 3,200 rows including Zepto "Veg Snacks" (10 brands, 386 stores, 2026-11-12 to 2026-11-13) and 18 Blinkit-vs-Zepto city price matches.
+- **Cron:** job `sidnl-competitors` was created inside dash_013's long transaction and pg_cron never started it (0 runs at 06:40 and 06:50).
+  `dash_014` (applied 06:57 UTC, version `20261113065746`) registered it again as job 27; it ran by itself at 07:00:00 (39 s, success).
+  A manual `select dash.refresh_competitors();` takes about 30 s.
+
+## 5c. SI ids in dash (`dash_015`, applied 2026-11-13)
+Rule: an SI id (`sidnl_id`) is derived only from silver, by an exact join: `product_key` -> `silver.product_xref` (unique on `product_key`;
+all 7,485 products and all 68,787 readings resolve), or `platform + platform_product_id` -> `silver.dim_product` -> `product_xref`.
+SI ids are renumbered by `silver.resequence_sidnl()`, so a table that is refreshed on its own schedule must **not store** one: it keeps
+`product_key` and the id is resolved at read time. (Found 2026-11-13: 4,333 of 16,204 `comp_sku_day` rows, 27 %, held a stale id.)
+
+| dash object | grain | SI id |
+|---|---|---|
+| `availability`, `pricing`, `visibility`, `overview`, `supply`, `dim_product`, `dim_sidnl` | SKU (gold rebuilds them in full after each successful silver run) | stored; checked 2026-11-13: 0 null, 0 not in `dim_sidnl`, 0 merged/inactive, `dim_product` = `product_xref` for all 7,485 |
+| `comp_sku_day` | SKU x city x day | **not stored**; read `v_comp_sku_day` (live id). `v_comp_cross_marketplace` is built on it |
+| `v_valid_reading` | one silver reading | `sidnl_id` added as the last column (live) |
+| `cfg_sku` | client target list by `platform_product_id` | `v_cfg_sku` resolves product_key + sidnl_id (`is_mapped` = false if the platform product is not in silver) |
+| `ads` | campaign x keyword / placement x day | **NULL by design**: the export has no product (0 of 70 "Asset" values match a `platform_product_id` or name; contract v1: "SKU-level ads report ... awaiting first export"). Brand link only, via `cfg_workspace_map` (account 791 and campaigns 284970, 330981, `sov` = Mr Munchies; `v_workspace_ads`, `v_workspace_sov_keyword`) |
+| `ads_campaign_period`, `ads_keyword_sov`, `v_sov_keyword` | campaign / keyword x period | not product grain: no SI id |
+| `comp_brand_day`, `v_brand_scorecard*`, `v_comp_price_gap` | brand (x category x city) | not product grain: keyed by `brand_key` |
+| `coverage`, `collection_health`, `dim_store`, `dim_city`, `dim_category`, `dim_date`, `dim_platform`, `cfg_threshold`, `cfg_workspace_map`, `metric_catalog`, `refresh_*`, `v_*freshness`, `v_refresh_status` | store / city / date / config | not product grain: no SI id |
+To give ads an SI id, a SKU-level ads report (campaign -> product list or per-product rows) is needed; then the join is `platform_product_id` -> `dim_product` -> `product_xref`.
+A campaign with several products has no per-product spend, so spend cannot be split by SI id from campaign totals.
+Same renumbering window exists for the gold tables themselves (resequence in a run, gold refresh up to a minute later, longer if a run ends `partial`).
+
 ## 6. Proof that dash = bronze (`silver_061`, `silver_063`)
 `silver.reconcile()` (daily) compares every reading and every shelf fact with its bronze row (price, MRP, inventory,
 rank, ad flag, product, store, platform, time, city), and recomputes `dash.pricing`, availability OSA counts and

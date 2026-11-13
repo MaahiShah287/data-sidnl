@@ -1,37 +1,43 @@
 import KpiCard from '@/components/KpiCard';
 import Header, { Empty } from '@/components/Header';
+import FilterBar from '@/components/FilterBar';
 import { HBar } from '@/components/Charts';
-import { q, pct, n } from '@/lib/db';
+import { q, pct, n, SP, pickPlatform } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
-export default async function VisibilityPage() {
+export default async function VisibilityPage({ searchParams }: { searchParams?: SP }) {
+  const pf = pickPlatform(searchParams);
+  const args = [pf];
+  const P = (a = '') => `($1::text is null or ${a}platform = $1)`;
+
   const [[k], brands, kws] = await Promise.all([
-    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category')
+    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category' and ${P()})
        select dt::text, count(distinct (platform, city_slug, search_term)) markets,
               avg(avg_search_rank)::float8 rank,
               sum(stores_listed)::float8/nullif(sum(stores_scanned),0)*100 coverage
-         from dash.visibility, d where search_type='category' and obs_date = d.dt group by dt`),
+         from dash.visibility, d where search_type='category' and obs_date = d.dt and ${P()} group by dt`, args),
     // brand SOV = sum of its SKUs' SOV inside each market; then averaged across markets
-    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category'),
+    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category' and ${P()}),
        m as (select s.brand_key, v.platform, v.city_slug, v.search_term,
                     sum(v.share_of_voice_pct) sov, avg(v.avg_search_rank) rank
                from dash.visibility v join dash.dim_sidnl s using (sidnl_id), d
-              where v.search_type='category' and v.obs_date = d.dt
+              where v.search_type='category' and v.obs_date = d.dt and ${P('v.')}
               group by 1,2,3,4)
        select brand_key brand, avg(sov)::float8 sov, avg(rank)::float8 rank, count(*) markets
-         from m group by 1 order by 2 desc nulls last limit 15`),
-    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='keyword')
+         from m group by 1 order by 2 desc nulls last limit 15`, args),
+    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='keyword' and ${P()})
        select v.search_term kw, s.canonical_name name, v.platform, v.city_slug,
               v.avg_search_rank::float8 rank, v.best_search_rank, v.impressions
          from dash.visibility v join dash.dim_sidnl s using (sidnl_id), d
-        where v.search_type='keyword' and v.obs_date = d.dt
-        order by v.avg_search_rank nulls last limit 25`),
+        where v.search_type='keyword' and v.obs_date = d.dt and ${P('v.')}
+        order by v.avg_search_rank nulls last limit 25`, args),
   ]);
 
   return (
     <div className="space-y-6">
-      <Header title="Visibility" subtitle="Share of voice, search rank, listing coverage" />
+      <Header title="Visibility" subtitle="Share of voice, search rank, listing coverage (all brands on the shelf)" />
+      <FilterBar base="/visibility" platform={pf} />
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <KpiCard title="Avg search rank" value={n(k?.rank)} subtitle={`as of ${k?.dt ?? '—'}`} />
         <KpiCard title="Listing coverage" value={pct(k?.coverage)} />

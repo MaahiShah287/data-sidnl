@@ -1,35 +1,44 @@
 import KpiCard from '@/components/KpiCard';
 import Header, { Empty } from '@/components/Header';
+import FilterBar from '@/components/FilterBar';
 import { Trend } from '@/components/Charts';
-import { q, pct, n, osaColor } from '@/lib/db';
+import { q, pct, n, osaColor, SP, pickPlatform, pickBrand, fP, fB, clientBrands } from '@/lib/db';
+import Link from 'next/link';
 
 export const dynamic = 'force-dynamic';
 
-export default async function OverviewPage() {
-  const [[a], [p], [v], [ov, ads, sup], trend, plat] = await Promise.all([
-    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null)
+export default async function OverviewPage({ searchParams }: { searchParams?: SP }) {
+  const pf = pickPlatform(searchParams);
+  const bk = pickBrand(searchParams);
+  const args = [pf, bk];
+  const F0 = `${fP()} and ${fB()}`;
+  const P0 = fP();
+
+  const [[a], [p], [v], [ov, ads, sup], trend, plat, brands] = await Promise.all([
+    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null and ${F0})
        select dt::text, sum(osa_available_obs)::float8/nullif(sum(osa_eligible_obs),0)*100 osa,
               sum(ds_listed_stores)::float8/nullif(sum(ds_eligible_stores),0)*100 ds_listing,
               count(distinct sidnl_id) skus,
               count(*) filter (where out_of_stock_stores > 0) oos_rows
-         from dash.availability, d where store_key is null and obs_date = d.dt group by dt`),
-    q(`with d as (select max(obs_date) dt from dash.pricing)
+         from dash.availability, d where store_key is null and obs_date = d.dt and ${F0} group by dt`, args),
+    q(`with d as (select max(obs_date) dt from dash.pricing where ${F0})
        select dt::text, avg(selling_price)::float8 asp, avg(weighted_discount_pct)::float8 disc,
               count(*) filter (where is_parity_break) parity_breaks
-         from dash.pricing, d where obs_date = d.dt group by dt`),
-    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category')
+         from dash.pricing, d where obs_date = d.dt and ${F0} group by dt`, args),
+    q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category' and ${P0})
        select dt::text, count(distinct search_term) markets, avg(avg_search_rank)::float8 rank
-         from dash.visibility, d where search_type='category' and obs_date = d.dt group by dt`),
+         from dash.visibility, d where search_type='category' and obs_date = d.dt and ${P0} group by dt`, [pf]),
     q(`select (select count(*) from dash.overview) ov, (select count(*) from dash.ads) ads, (select count(*) from dash.supply) sup`)
       .then(r => [r[0].ov, r[0].ads, r[0].sup]),
     q(`select obs_date::text d, platform,
               round((sum(osa_available_obs)::float8/nullif(sum(osa_eligible_obs),0)*100)::numeric,1)::float8 osa
-         from dash.availability where store_key is null group by 1,2 order by 1`),
-    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null)
+         from dash.availability where store_key is null and ${F0} group by 1,2 order by 1`, args),
+    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null and ${F0})
        select platform, sum(osa_available_obs)::float8/nullif(sum(osa_eligible_obs),0)*100 osa,
               sum(ds_listed_stores)::float8/nullif(sum(ds_eligible_stores),0)*100 ds_listing,
               count(distinct sidnl_id) skus, count(distinct city_slug) cities
-         from dash.availability, d where store_key is null and obs_date = d.dt group by 1 order by 4 desc`),
+         from dash.availability, d where store_key is null and obs_date = d.dt and ${F0} group by 1 order by 4 desc`, args),
+    clientBrands(),
   ]);
 
   const days = Array.from(new Set(trend.map((r: any) => r.d)));
@@ -43,6 +52,7 @@ export default async function OverviewPage() {
   return (
     <div className="space-y-6">
       <Header title="Overview" subtitle="Live from silver → dash, refreshed after every pipeline run" />
+      <FilterBar base="/" platform={pf} brand={bk} brands={brands} />
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <KpiCard title="OSA %" value={pct(a?.osa)} subtitle={`as of ${a?.dt ?? '—'}`} />
@@ -55,7 +65,7 @@ export default async function OverviewPage() {
 
       <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
         <h2 className="section-title">OSA % by day</h2>
-        <Trend data={chart} x="d" series={platforms} />
+        {chart.length ? <Trend data={chart} x="d" series={platforms} /> : <Empty what="No availability rows for this filter." />}
       </div>
 
       <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
@@ -75,10 +85,19 @@ export default async function OverviewPage() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {Number(ov) === 0 && <Empty what="Sales (GMV, net sales, units, market share): waiting for a sales feed." />}
+        {Number(ov) === 0 && <Empty what="Sales (GMV, net sales, units, market share): waiting for a sales / orders feed (Blinkit and Zepto first-party)." />}
         {Number(ads) === 0 && <Empty what="Ads (spend, ROAS, campaigns): waiting for a retail-media feed." />}
+        {Number(ads) > 0 && (
+          <div className="bg-white rounded-xl border border-slate-200 p-5 text-sm text-slate-600">
+            Blinkit ads are live (first-party export) - <Link href="/ads" className="text-blue-600 underline">open Ads</Link>.
+            Zepto ads: waiting for the Zepto first-party export.
+          </div>
+        )}
         {Number(sup) === 0 && <Empty what="Supply (POs, invoices, EDI): waiting for a vendor-portal / ERP feed." />}
       </div>
+      <p className="text-xs text-slate-500">
+        Which of the 171 handbook metrics are visible and which are not: <Link href="/metrics" className="text-blue-600 underline">Metric coverage</Link>.
+      </p>
     </div>
   );
 }

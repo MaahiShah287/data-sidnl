@@ -24,7 +24,8 @@ ops     run history, quality results, alerts, checks       (ops.*)
 | `sql/rollbacks.sql` | the rollback for each migration since `silver_041` (undo newest first) |
 | `sql/manifest.csv` | every applied migration: version, name, md5 of the applied SQL |
 | `sql/migrations/` | exact SQL of the migrations applied since 2026-11-11 (`silver_069`–`073`, `dash_011`); md5 in `manifest.csv`, checked by the tests. Status report: [docs/PIPELINE_STATUS_2026-11-11.md](docs/PIPELINE_STATUS_2026-11-11.md) |
-| `sql/pending/` | migrations written but not yet applied (apply order in `ORDER`); empty today |
+| `sql/pending/` | migrations written but not yet applied (apply order in `ORDER`); empty today. Applied 2026-11-13: `silver_075` + `silver_076` (pipeline fix, bronze dropped `platform_listings` columns), `dash_013` (competitor layer) `dash_014` (its cron job) and `dash_015` (SI id mapping in dash), see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 5b |
+| `docs/METRIC_COVERAGE_2026-11-13.md` | which of the 171 handbook metrics are visible / proxy / partly / not visible and what unblocks each (`python scripts/metric_coverage.py`; portal page `/metrics`) |
 | `sidnl.py` | command line (below) |
 | `tests/test_live_db.py` | tests against the live database (skipped without `SUPABASE_DB_URL`) |
 | `tests/test_offline.py` | tests that need no database: bronze→silver column contract, migrations (rollback, md5, preflight, parse), CLI retry |

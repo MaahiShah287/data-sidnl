@@ -1,50 +1,59 @@
 import KpiCard from '@/components/KpiCard';
 import Header, { Empty } from '@/components/Header';
+import FilterBar from '@/components/FilterBar';
 import { HBar } from '@/components/Charts';
-import { q, pct, n, osaColor } from '@/lib/db';
+import { q, pct, n, osaColor, SP, pickPlatform, pickBrand, fP, fB, clientBrands } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
-export default async function AvailabilityPage() {
-  const [dm, brands, cats, critical, dates] = await Promise.all([
+export default async function AvailabilityPage({ searchParams }: { searchParams?: SP }) {
+  const pf = pickPlatform(searchParams);
+  const bk = pickBrand(searchParams);
+  const args = [pf, bk];
+  const F = `${fP('a.')} and ${fB('a.')}`;
+  const F0 = `${fP()} and ${fB()}`;
+
+  const [dm, brands, cats, critical, dates, brandList] = await Promise.all([
     // D-0..D-3 = the latest four observation dates; OSA = SUM(available)/SUM(eligible)
     q(`with d as (select obs_date, row_number() over (order by obs_date desc) rn
-                    from (select distinct obs_date from dash.availability where store_key is null) x)
+                    from (select distinct obs_date from dash.availability where store_key is null and ${F0}) x)
        select a.platform, a.city_slug, c.city_name,
          max(case when d.rn=1 then osa end) d0, max(case when d.rn=2 then osa end) d1,
          max(case when d.rn=3 then osa end) d2, max(case when d.rn=4 then osa end) d3
        from (select obs_date, platform, city_slug,
                     sum(osa_available_obs)::float8/nullif(sum(osa_eligible_obs),0)*100 osa
-               from dash.availability where store_key is null group by 1,2,3) a
+               from dash.availability where store_key is null and ${F0} group by 1,2,3) a
        join d using (obs_date) left join dash.dim_city c using (city_slug)
-       where d.rn <= 4 group by 1,2,3 order by 1, 2`),
-    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null)
+       where d.rn <= 4 group by 1,2,3 order by 1, 2`, args),
+    q(`with d as (select max(obs_date) dt from dash.availability a where store_key is null and ${F})
        select s.brand_key brand, sum(a.osa_available_obs)::float8/nullif(sum(a.osa_eligible_obs),0)*100 osa,
               count(distinct a.sidnl_id) skus
          from dash.availability a join dash.dim_sidnl s using (sidnl_id), d
-        where a.store_key is null and a.obs_date = d.dt
-        group by 1 having sum(a.osa_eligible_obs) > 0 order by 2 desc limit 15`),
-    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null)
+        where a.store_key is null and a.obs_date = d.dt and ${F}
+        group by 1 having sum(a.osa_eligible_obs) > 0 order by 2 desc limit 15`, args),
+    q(`with d as (select max(obs_date) dt from dash.availability a where store_key is null and ${F})
        select coalesce(nullif(s.category_path,''),'(uncategorised)') category,
               sum(a.osa_available_obs)::float8/nullif(sum(a.osa_eligible_obs),0)*100 osa,
               count(distinct a.sidnl_id) skus
          from dash.availability a join dash.dim_sidnl s using (sidnl_id), d
-        where a.store_key is null and a.obs_date = d.dt
-        group by 1 having sum(a.osa_eligible_obs) > 0 order by 3 desc limit 20`),
-    q(`with d as (select max(obs_date) dt from dash.availability where store_key is null)
+        where a.store_key is null and a.obs_date = d.dt and ${F}
+        group by 1 having sum(a.osa_eligible_obs) > 0 order by 3 desc limit 20`, args),
+    q(`with d as (select max(obs_date) dt from dash.availability a where store_key is null and ${F})
        select s.canonical_name name, a.platform, a.city_slug, a.osa_pct::float8 osa,
               a.out_of_stock_stores oos, a.inventory_fe, a.potential_sales_loss::float8 loss, a.priority
          from dash.availability a join dash.dim_sidnl s using (sidnl_id), d
-        where a.store_key is null and a.obs_date = d.dt and a.is_critical
-        order by a.potential_sales_loss desc nulls last, a.osa_pct limit 15`),
-    q(`select distinct obs_date::text d from dash.availability where store_key is null order by 1 desc limit 4`),
+        where a.store_key is null and a.obs_date = d.dt and a.is_critical and ${F}
+        order by a.potential_sales_loss desc nulls last, a.osa_pct limit 15`, args),
+    q(`select distinct obs_date::text d from dash.availability where store_key is null and ${F0} order by 1 desc limit 4`, args),
+    clientBrands(),
   ]);
 
   const lbl = (i: number) => dates[i]?.d ?? '—';
 
   return (
     <div className="space-y-6">
-      <Header title="Availability" subtitle="OSA, DS listing, stock-outs, RCA" />
+      <Header title="Availability" subtitle="OSA, DS listing, stock-outs, RCA (client brands; competitor shelf OSA is on the Competitors page)" />
+      <FilterBar base="/availability" platform={pf} brand={bk} brands={brandList} />
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         {[0, 1, 2, 3].map(i => {

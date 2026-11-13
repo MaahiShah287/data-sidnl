@@ -1395,3 +1395,139 @@ end $function$;
 alter table silver.fact_fp_ads drop column if exists platform, drop column if exists source_file,
                                drop column if exists pacing_type, drop column if exists placement,
                                drop column if exists dq_flags;
+
+-- ==================================================================== 20261113062816 silver_075_platform_listings_brand_drift
+-- Puts back the original text of silver.refresh_brand (it reads platform_listings.brand, a column the scraper
+-- schema no longer has, so the discover stage and refresh_brand fail again: only do this if the column returns).
+do $rb$
+declare v_def text;
+begin
+    v_def := pg_get_functiondef('silver.refresh_brand(text,boolean)'::regprocedure);
+    execute replace(v_def, 'coalesce(to_jsonb(pl) ->> ''brand'', p.brand)', 'coalesce(pl.brand, p.brand)');
+end
+$rb$;
+create or replace function silver.refresh_brand_strings(p_full boolean default false)
+ returns integer
+ language plpgsql
+ set search_path to 'silver', 'ops', 'public', 'pg_temp'
+as $function$
+declare v_n int := 0; v_c int;
+begin
+    insert into silver.brand_string_registry (raw_brand)
+    select distinct brand::text from public.platform_products where brand is not null
+    on conflict do nothing;
+    get diagnostics v_c = row_count; v_n := v_n + v_c;
+
+    insert into silver.brand_string_registry (raw_brand)
+    select distinct brand::text from public.platform_listings where brand is not null
+    on conflict do nothing;
+    get diagnostics v_c = row_count; v_n := v_n + v_c;
+
+    insert into silver.brand_string_registry (raw_brand)
+    select distinct brand::text from public.products where brand is not null
+    on conflict do nothing;
+    get diagnostics v_c = row_count;
+    return v_n + v_c;
+end $function$;
+
+-- ==================================================================== 20261113062951 dash_013_competitors
+-- Purely additive objects (two tables, one function, two views, one cron job). No bronze/silver data is touched.
+do $rb$
+begin
+    if exists (select 1 from cron.job where jobname = 'sidnl-competitors') then
+        perform cron.unschedule('sidnl-competitors');
+    end if;
+end
+$rb$;
+drop view if exists dash.v_comp_cross_marketplace;
+drop view if exists dash.v_comp_price_gap;
+drop function if exists dash.refresh_competitors();
+drop table if exists dash.comp_brand_day;
+drop table if exists dash.comp_sku_day;
+delete from dash.refresh_table_state where table_name in ('comp_sku_day', 'comp_brand_day');
+
+-- ==================================================================== 20261113065733 silver_076_refresh_brand_listing_columns
+-- Puts back the original _listings select of silver.refresh_brand (it reads platform_listings.name / pack_size /
+-- image_url, columns the scraper schema no longer has, so refresh_brand fails again: only do this if they return).
+do $rb$
+declare v_def text;
+begin
+    v_def := pg_get_functiondef('silver.refresh_brand(text,boolean)'::regprocedure);
+    v_def := replace(v_def, E'\n    left join public.platform_products pp on pp.platform = pl.platform and pp.external_id = pl.external_id', '');
+    v_def := replace(v_def, 'pp.image_url     as image_url,', 'coalesce(pl.image_url, p.image_url)     as image_url,');
+    v_def := replace(v_def, 'pp.pack                                 as pack_size,', 'pl.pack_size,');
+    v_def := replace(v_def, 'coalesce(pp.name, p.name)', 'coalesce(pl.name, p.name)');
+    execute v_def;
+end
+$rb$;
+
+-- ==================================================================== 20261113065746 dash_014_competitors_cron_reregister
+-- Removes the cron job (dash_013's rollback does the same). The tables and refresh function stay; refresh by hand with
+-- select dash.refresh_competitors();
+do $rb$
+begin
+    if exists (select 1 from cron.job where jobname = 'sidnl-competitors') then
+        perform cron.unschedule('sidnl-competitors');
+    end if;
+end
+$rb$;
+
+-- ==================================================================== 20261113071412 dash_015_sidnl_id_mapping
+-- Back to a stored comp_sku_day.sidnl_id (filled from product_xref now, stale again after the next renumbering), the dash_013
+-- refresh function text, the cross-marketplace view on the table, and dash.v_valid_reading without sidnl_id.
+-- Removes dash.v_comp_sku_day, dash.v_cfg_sku and the comment on dash.ads.sidnl_id.
+drop view if exists dash.v_cfg_sku;
+drop view if exists dash.v_comp_cross_marketplace;
+drop view if exists dash.v_comp_sku_day;
+alter table dash.comp_sku_day add column if not exists sidnl_id text;
+update dash.comp_sku_day c set sidnl_id = x.sidnl_id from silver.product_xref x where x.product_key = c.product_key;
+create index if not exists comp_sku_day_sidnl_idx on dash.comp_sku_day (sidnl_id, city_slug) where sidnl_id is not null;
+do $rb$
+declare v_def text;
+begin
+    v_def := pg_get_functiondef('dash.refresh_competitors()'::regprocedure);
+    v_def := replace(v_def, 'product_key, brand_key, brand_name,', 'product_key, sidnl_id, brand_key, brand_name,');
+    v_def := replace(v_def, 'dp.total_content,', 'dp.total_content, x.sidnl_id,');
+    v_def := replace(v_def, 'left join silver.dim_brand db on db.brand_key = dp.brand_key',
+                     E'left join silver.dim_brand db on db.brand_key = dp.brand_key\n              left join silver.product_xref x on x.product_key = a.product_key');
+    execute v_def;
+end
+$rb$;
+create view dash.v_comp_cross_marketplace as
+with latest as (
+    select distinct on (platform, city_slug, sidnl_id)
+           platform, city_slug, sidnl_id, brand_key, brand_name, product_name, pack_raw, obs_date,
+           sp_median, mrp_median, price_per_100, price_unit
+      from dash.comp_sku_day
+     where sidnl_id is not null and sp_median is not null
+     order by platform, city_slug, sidnl_id, obs_date desc),
+multi as (select city_slug, sidnl_id from latest group by 1, 2 having count(distinct platform) >= 2)
+select l.sidnl_id, l.city_slug, max(l.brand_name) as brand_name, max(l.product_name) as product_name,
+       max(l.pack_raw) as pack_raw,
+       min(l.sp_median) as min_sp, max(l.sp_median) as max_sp,
+       max(l.sp_median) - min(l.sp_median) as price_gap,
+       round(100 * (max(l.sp_median) - min(l.sp_median)) / nullif(min(l.sp_median), 0), 2) as price_gap_pct,
+       (array_agg(l.platform order by l.sp_median asc,  l.platform))[1] as cheapest_platform,
+       (array_agg(l.platform order by l.sp_median desc, l.platform))[1] as dearest_platform,
+       jsonb_object_agg(l.platform, l.sp_median) as sp_by_platform,
+       jsonb_object_agg(l.platform, l.obs_date)  as obs_date_by_platform
+  from latest l join multi m using (city_slug, sidnl_id)
+ group by l.sidnl_id, l.city_slug;
+alter view dash.v_comp_price_gap reset (security_invoker);
+drop view if exists dash.v_valid_reading;
+create view dash.v_valid_reading with (security_invoker = true) as
+select r.reading_key, r.source_type, r.source_record_id, r.job_ref, r.observed_at, r.obs_date, r.platform, r.brand_key,
+       r.brand_name, r.company_name, r.product_key, r.platform_product_id, r.product_name, r.variant, r.product_type,
+       r.pack_raw, r.size_value, r.size_unit, r.pack_count, r.l1_id, r.l1_category, r.l2_id, r.l2_category, r.l3_id,
+       r.l3_category, r.category_path, r.store_key, r.source_store_id, r.store_external_id, r.store_name, r.city_slug,
+       r.city_name, r.state, r.latitude, r.longitude, r.stock_status, r.is_listed, r.is_available, r.inventory_units,
+       r.inventory_is_capped, r.selling_price, r.mrp, r.discount_amount, r.discount_pct, r.search_position,
+       r.organic_position, r.is_ad, r.ad_type, r.osa_eligible, r.dq_status, r.dq_flags, r.age_hours, r.freshness
+  from silver.v_reading r
+  join silver.dim_platform dp on dp.platform = r.platform and not dp.is_test
+ where r.dq_status = 'valid';
+comment on view dash.v_valid_reading is
+    'silver.v_reading limited to dq_status=valid and non-test platforms. Single entry point for all gold metrics.';
+comment on table dash.comp_sku_day is
+    'Competitor layer: one SKU x city x day from category-shelf scrapes (all brands that share a shelf with a client brand). sp_median = median over the stores that listed it; osa_pct = in_stock_obs / valid_obs.';
+comment on column dash.ads.sidnl_id is null;

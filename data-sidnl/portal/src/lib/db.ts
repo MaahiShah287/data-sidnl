@@ -20,6 +20,45 @@ export async function q<T = any>(sql: string, params: any[] = []): Promise<T[]> 
   return r.rows as T[];
 }
 
+/** Like q(), but never throws: returns the error text instead, so a page can say
+ *  "this table is not created yet" (migration pending) instead of crashing. */
+export async function qSafe<T = any>(sql: string, params: any[] = []): Promise<{ rows: T[]; error: string | null }> {
+  try {
+    return { rows: await q<T>(sql, params), error: null };
+  } catch (e: any) {
+    return { rows: [], error: String(e?.message ?? e) };
+  }
+}
+
+// ---- page filters (?platform=zepto&brand=mr munchies) -----------------------------------------------------------
+export const KNOWN_PLATFORMS = ['blinkit', 'zepto', 'instamart', 'jiomart'];
+export type SP = { [k: string]: string | string[] | undefined };
+const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v);
+
+/** platform filter from the URL; null = all platforms */
+export function pickPlatform(sp?: SP): string | null {
+  const p = one(sp?.platform)?.toLowerCase();
+  return p && KNOWN_PLATFORMS.includes(p) ? p : null;
+}
+/** brand filter from the URL (silver brand_key, lower-case); null = all brands */
+export function pickBrand(sp?: SP): string | null {
+  const b = one(sp?.brand)?.toLowerCase().trim();
+  return b ? b.slice(0, 80) : null;
+}
+export const pickParam = (sp: SP | undefined, k: string): string | null => one(sp?.[k])?.trim() || null;
+
+/** SQL fragments for the two filters. Convention: $1 = platform (text|null), $2 = brand_key (text|null). */
+export const fP = (a = '') => `($1::text is null or ${a}platform = $1)`;
+export const fB = (a = '') =>
+  `($2::text is null or ${a}sidnl_id in (select sidnl_id from dash.dim_sidnl where brand_key = $2))`;
+
+/** the client brands (the focal brands of the competitor pages) */
+export async function clientBrands() {
+  const r = await qSafe<{ brand_key: string; brand_name: string }>(
+    `select brand_key, brand_name from dash.dim_brand where is_client order by brand_name`);
+  return r.rows;
+}
+
 export const n = (v: any, d = 1) =>
   v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d);
 export const pct = (v: any, d = 1) => (v == null ? '—' : `${Number(v).toFixed(d)}%`);

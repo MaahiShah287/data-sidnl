@@ -3,7 +3,11 @@ Claude outputs/
 # Environment files (secrets — never commit)
 .env
 .env.*
+env
 !.env.example
 
 # First-party portal exports (company data, never commit)
 /first_party/
+
+# separate working clone, not part of this repo
+/sidnl-backend-frontend/
