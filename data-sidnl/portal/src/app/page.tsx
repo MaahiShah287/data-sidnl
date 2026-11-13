@@ -28,8 +28,10 @@ export default async function OverviewPage({ searchParams }: { searchParams?: SP
     q(`with d as (select max(obs_date) dt from dash.visibility where search_type='category' and ${P0})
        select dt::text, count(distinct search_term) markets, avg(avg_search_rank)::float8 rank
          from dash.visibility, d where search_type='category' and obs_date = d.dt and ${P0} group by dt`, [pf]),
-    q(`select (select count(*) from dash.overview) ov, (select count(*) from dash.ads) ads, (select count(*) from dash.supply) sup`)
-      .then(r => [r[0].ov, r[0].ads, r[0].sup]),
+    // first-party feeds (dash.v_fp_* views); never let a missing view take the whole Overview down
+    q(`select (select count(*) from dash.v_fp_sales_day) ov, (select count(*) from dash.v_fp_ad_page) ads, (select count(*) from dash.v_fp_po_summary) sup`)
+      .then(r => [r[0].ov, r[0].ads, r[0].sup])
+      .catch(() => [0, 0, 0]),
     q(`select obs_date::text d, platform,
               round((sum(osa_available_obs)::float8/nullif(sum(osa_eligible_obs),0)*100)::numeric,1)::float8 osa
          from dash.availability where store_key is null and ${F0} group by 1,2 order by 1`, args),
@@ -85,15 +87,26 @@ export default async function OverviewPage({ searchParams }: { searchParams?: SP
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {Number(ov) === 0 && <Empty what="Sales (GMV, net sales, units, market share): waiting for a sales / orders feed (Blinkit and Zepto first-party)." />}
-        {Number(ads) === 0 && <Empty what="Ads (spend, ROAS, campaigns): waiting for a retail-media feed." />}
-        {Number(ads) > 0 && (
+        {Number(ov) === 0 && <Empty what="Sales (GMV, units, ASP): no first-party sales loaded." />}
+        {Number(ov) > 0 && (
           <div className="bg-white rounded-xl border border-slate-200 p-5 text-sm text-slate-600">
-            Blinkit ads are live (first-party export) - <Link href="/ads" className="text-blue-600 underline">open Ads</Link>.
-            Zepto ads: waiting for the Zepto first-party export.
+            Zepto first-party sales are live - <Link href="/sales" className="text-blue-600 underline">open Sales</Link> (GMV, units, ASP, city performance, stock cover).
           </div>
         )}
-        {Number(sup) === 0 && <Empty what="Supply (POs, invoices, EDI): waiting for a vendor-portal / ERP feed." />}
+        {Number(ads) === 0 && <Empty what="Ads (spend, ROAS, CTR): no ad-console export loaded." />}
+        {Number(ads) > 0 && (
+          <div className="bg-white rounded-xl border border-slate-200 p-5 text-sm text-slate-600">
+            Zepto ads (ad-console export, by page) are live - <Link href="/ads" className="text-blue-600 underline">open Ads</Link>.
+            Keyword- and campaign-level ads need a keyword-level export.
+          </div>
+        )}
+        {Number(sup) === 0 && <Empty what="Supply (POs, goods receipts, invoices): no first-party PO or invoice data loaded." />}
+        {Number(sup) > 0 && (
+          <div className="bg-white rounded-xl border border-slate-200 p-5 text-sm text-slate-600">
+            Purchase orders, goods receipts and invoices are live - <Link href="/supply" className="text-blue-600 underline">Supply</Link> ·{' '}
+            <Link href="/finance" className="text-blue-600 underline">Finance</Link>. EDI messages: waiting for an EDI gateway feed.
+          </div>
+        )}
       </div>
       <p className="text-xs text-slate-500">
         Which of the 171 handbook metrics are visible and which are not: <Link href="/metrics" className="text-blue-600 underline">Metric coverage</Link>.

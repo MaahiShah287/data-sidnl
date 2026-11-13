@@ -226,6 +226,85 @@ r(169, "Distribution Plans", "feed", needs=SHIP)
 r(170, "Days of Stock by City", "feed", needs=INV + " + sales")
 r(171, "Shipments", "feed", needs=SHIP)
 
+# ---- first-party feeds loaded 2026-11-13 (dash.fp_* tables, views in sql/migrations/dash_016_fp_metric_views.sql) -----
+# Zepto seller-portal exports: sales overview, product performance, PO, GRN, invoices, payments, debit notes, ledger,
+# ad-console page report and ad-wallet ledger. The Blinkit ad exports were removed from the database on request, so the
+# keyword- and campaign-level ad metrics that depended on them are back to "feed" until a keyword-level export is loaded.
+# live    = computed from a loaded feed at the metric's stated grain and shown on a page
+# partial = shown at a coarser grain, or part of the formula is missing (the note says which part)
+def ov(no, status, page="", plat="", needs="", note=""):
+    for m in M:
+        if m["n"] == no:
+            m.update(status=status, page=page, plat=plat, dep="", needs=needs, note=note)
+            return
+    raise KeyError(no)
+
+Z1 = "Z (1P)"
+# sales / stock
+ov(1, "live", "Sales", Z1, note="Gross GMV from the sales export (before discounts and refunds); date x city x SKU.")
+ov(2, "feed", needs="Refunds / discounts in the sales export", note="The export has gross GMV only.")
+ov(3, "live", "Sales", Z1, note="Units from the sales export (no returned-unit column, so gross units).")
+ov(4, "live", "Sales, Pricing", Z1 + " + B+Z scraped", note="Sales page: gross ASP = GMV / units. Pricing page: observed shelf price (labelled).")
+ov(7, "partial", "Sales", Z1, needs="Sales targets", note="Growth % vs the previous 28 days shown; target achievement needs targets.")
+ov(8, "feed", needs="Orders from a second marketplace", note="Only Zepto first-party sales are loaded.")
+ov(9, "partial", "Sales", Z1, needs="Net sales + targets", note="GMV, units, ASP and growth side by side; net sales and target achievement not available.")
+ov(20, "live", "Sales, Availability, Competitors", Z1 + " + B+Z scraped", note="City GMV share and growth vs previous 28 days (gross GMV).")
+ov(25, "partial", "Sales", Z1, needs="Warehouse / city stock", note="National days of inventory per SKU = stock on hand / average daily units (28 days).")
+ov(28, "partial", "Availability, Competitors, Sales", "B+Z + Z (1P)", needs="Multi-category sales", note="Sales export has one category (Frozen Food).")
+ov(29, "partial", "Availability, Pricing, Competitors, Sales", "B+Z + Z (1P)", needs="City-level stock", note="Now includes GMV, units, stock and days of inventory; stock is national.")
+ov(53, "partial", "Sales", Z1, needs="Warehouse / city stock", note="National stock on hand x latest landing cost per SKU.")
+ov(58, "partial", "Sales", Z1, needs="City / warehouse stock", note="SKUs with stock and no sales in 28 days (national).")
+# purchase orders / goods receipts
+ov(12, "partial", "Supply", Z1, needs="Confirmed committed delivery date", note="Supply fulfilment % shown; on-time % not asserted (delivery-date definition unconfirmed).")
+ov(68, "live", "Supply", Z1, note="Ordered qty x landing cost, per PO.")
+ov(69, "live", "Supply", Z1, note="Sum received / sum ordered; PO lines never received count as fully short.")
+ov(71, "live", "Supply", Z1, note="81 POs in the GRN export (all Expired or Locked).")
+ov(74, "partial", "Supply", Z1, needs="Open POs", note="Partially received POs counted; every PO in the export is already closed.")
+ov(75, "partial", "Supply", Z1, needs="Open POs + grace days", note="Short-received POs shown; the exports contain no open POs to be overdue.")
+ov(76, "live", "Supply", Z1, note="Fully received POs / POs, shown beside the unit fill rate.")
+ov(77, "live", "Supply", Z1, note="Source statuses (Expired / Locked); normalised buckets need procurement sign-off.")
+ov(78, "live", "Supply", Z1, note="POs, ordered qty and value by month.")
+ov(79, "partial", "Supply", Z1, needs="Committed delivery date definition", note="Days from PO delivery date to first receipt shown; not labelled on-time until confirmed.")
+ov(80, "live", "Supply", Z1, note="Ordered, shipped (ASN), received and open quantity per SKU and PO.")
+ov(82, "partial", "Supply", Z1, needs="Open POs + on-time definition", note="Lead time, fill rate and PO value shown; on-time and open PO value not.")
+ov(83, "partial", "Supply", Z1, needs="Overdue quantity", note="Ordered, received, open qty, fill rate and supplier count per SKU.")
+ov(84, "live", "Supply", Z1, note="Received qty x landing cost.")
+# invoices / finance
+ov(13, "partial", "Finance", Z1, needs="Due dates (overdue)", note="Invoice total, pending, payments and mismatch shown; overdue not available.")
+ov(85, "partial", "Finance", Z1, needs="Invoice line export", note="Invoice header amount plus shipped / received value from goods-receipt lines.")
+ov(86, "live", "Finance", Z1, note="Debit notes by month and type (quantity shortfall vs brand-funded discount).")
+ov(87, "live", "Finance", Z1, note="Distinct invoice headers, no line join.")
+ov(88, "partial", "Finance", Z1, needs="Per-invoice payment allocation", note="Invoice - matched quantity debit note - payments matched by reference.")
+ov(89, "feed", needs="Invoice due dates / payment terms")
+ov(91, "live", "Finance", Z1, note="Invoice vs shipped (ASN) and vs received quantity at PO cost.")
+ov(92, "live", "Finance", Z1, note="Invoice value by booking week.")
+ov(93, "partial", "Finance", Z1, needs="Due dates (overdue)", note="Paid and pending shown; overdue not available.")
+ov(94, "feed", needs="A second marketplace", note="All invoices are Zepto.")
+ov(95, "live", "Finance", Z1, note="Ageing by invoice age (labelled), not days overdue.")
+ov(96, "partial", "Finance", Z1, needs="Dispute status", note="Invoice, PO, amounts, debit note and pending shown; dispute status not available.")
+# ads
+ov(14, "live", "Ads", Z1, note="ROAS and ACOS from the Zepto ad-console export (all pages).")
+ov(18, "partial", "Ads", Z1, needs="Campaign-level export", note="ROAS, CTR, CPC and conversion by ad page; the export has no campaigns.")
+ov(121, "live", "Ads", Z1, note="Spend from the ad-console export by page.")
+ov(122, "live", "Ads", Z1, note="Revenue attributed by the ad console, by page.")
+ov(123, "live", "Ads", Z1, note="Attributed sales / spend; shown as — when spend is 0.")
+ov(124, "live", "Ads", Z1)
+ov(125, "live", "Ads", Z1)
+ov(126, "live", "Ads", Z1, note="Clicks / impressions, recomputed from additive columns.")
+ov(127, "live", "Ads", Z1, note="Spend / clicks, recomputed from additive columns.")
+ov(128, "live", "Ads", Z1, note="Conversion = orders / clicks (event: order).")
+ov(129, "partial", "Ads", Z1, needs="Attributed sales by day", note="Daily ad-wallet spend shown; the export has no daily attributed sales.")
+ov(130, "feed", needs="Dated ad export", note="The Zepto ad export has no dates.")
+ov(131, "partial", "Ads", Z1, needs="Dated ad export", note="Totals and CTR shown; no time trend.")
+ov(132, "live", "Ads", Z1, note="CTR and conversion by ad page at the same grain.")
+ov(133, "partial", "Ads", Z1, needs="Blinkit ad export", note="Zepto only; Blinkit ad data was removed.")
+ov(134, "feed", needs="Campaign-level export")
+ov(135, "feed", needs="Campaign / keyword-level export + thresholds")
+ov(136, "feed", needs="Campaign-level export")
+for _n in (144, 148, 152, 153):
+    ov(_n, "feed", needs="Keyword-level ad export", note="The keyword ad data was removed; Zepto's export has no keywords.")
+ov(149, "proxy", "Visibility", "B+Z scraped", needs="Search impressions", note="Share of shelf / rank proxy only; the keyword ad impressions were removed.")
+
 SEC_OF = {}
 _bounds = [(1, 22, 1), (23, 30, 2), (31, 41, 3), (42, 51, 4), (52, 67, 5), (68, 83, 6), (84, 96, 7), (97, 120, 8),
            (121, 136, 9), (137, 141, 10), (142, 156, 11), (157, 167, 12), (168, 171, 13)]
@@ -256,7 +335,7 @@ def build():
            "## Read this first",
            "- **Applied 2026-11-13:** `silver_075` + `silver_076` (the scraper schema dropped `platform_listings.brand / name / pack_size / image_url`, so every silver run had failed since 2026-11-11), `dash_013` (competitor tables) and `dash_014` (cron job re-registered). "
            "The pipeline has been healthy since run 1681 (07:00-07:02 UTC); Overview / Availability / Pricing / Visibility and the competitor pages are current for Blinkit and Zepto.",
-           "- Competitor figures cover Blinkit \"Frozen Veg Snacks\" and Zepto \"Veg Snacks\" (categories where a client brand is listed). Share of shelf is a proxy for share of voice / market share. Mr. Munchies' Zepto first-party export (sales, ads) has not been delivered, so Zepto sales and ad metrics are not available.",
+           "- Competitor figures cover Blinkit \"Frozen Veg Snacks\" and Zepto \"Veg Snacks\" (categories where a client brand is listed). Share of shelf is a proxy for share of voice / market share. Zepto first-party exports (sales, stock, PO, GRN, invoices, payments, ledger, ad console) are loaded in dash.fp_* and shown on the Sales, Supply, Finance and Ads pages. The Blinkit ad exports were removed from the database on request, so keyword- and campaign-level ad metrics are not available until a keyword-level export is loaded.",
            "- Status is about what is wired to a portal page, not what is theoretically possible. `Visible (proxy)` means shown and labelled as a proxy, as the handbook allows.",
            "- Core rule of the handbook applies: no sales, GMV, inventory, ads or finance number is ever estimated from scraped prices; those rows say *Not available*.", "",
            "## Totals", "", "| Status | Metrics |", "|---|---|"]

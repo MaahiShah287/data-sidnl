@@ -62,6 +62,16 @@ export async function clientBrands() {
 export const n = (v: any, d = 1) =>
   v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d);
 export const pct = (v: any, d = 1) => (v == null ? '—' : `${Number(v).toFixed(d)}%`);
+/** Indian-grouped rupee amount, e.g. ₹12,95,934. null/NaN -> '—' (never shown as 0). */
+export const inr = (v: any, d = 0) =>
+  v == null || Number.isNaN(Number(v))
+    ? '—'
+    : `${Number(v) < 0 ? '-' : ''}₹${Math.abs(Number(v)).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
+/** Indian-grouped plain number. */
+export const num = (v: any, d = 0) =>
+  v == null || Number.isNaN(Number(v))
+    ? '—'
+    : Number(v).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
 export const osaColor = (v: number | null) =>
   v == null ? 'text-slate-400' : v >= 80 ? 'text-emerald-600' : v >= 60 ? 'text-amber-600' : 'text-red-600';
 

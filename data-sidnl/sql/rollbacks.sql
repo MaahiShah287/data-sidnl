@@ -1531,3 +1531,18 @@ comment on view dash.v_valid_reading is
 comment on table dash.comp_sku_day is
     'Competitor layer: one SKU x city x day from category-shelf scrapes (all brands that share a shelf with a client brand). sp_median = median over the stores that listed it; osa_pct = in_stock_obs / valid_obs.';
 comment on column dash.ads.sidnl_id is null;
+
+-- dash_016_fp_metric_views rollback: drops the metric views and puts the fp_* tables back to RLS-off (data is kept).
+drop view if exists dash.v_fp_ad_wallet_day, dash.v_fp_ad_page, dash.v_fp_finance_summary, dash.v_fp_debit_note_month,
+  dash.v_fp_invoice_recon, dash.v_fp_po_month, dash.v_fp_po_status, dash.v_fp_po_sku, dash.v_fp_po_summary,
+  dash.v_fp_po_line_all, dash.v_fp_sales_sku, dash.v_fp_sku_cost, dash.v_fp_sku_stock, dash.v_fp_sales_city,
+  dash.v_fp_sales_health, dash.v_fp_sales_month, dash.v_fp_sales_day;
+do $$ declare t text; begin
+  foreach t in array array['fp_sku','fp_sku_name','fp_sales_daily','fp_po','fp_po_line','fp_grn_line','fp_ad_wallet_txn',
+    'fp_ad_page_perf','fp_fill_rate','fp_new_user_share','fp_invoice','fp_payment_advice','fp_debit_credit_note',
+    'fp_ledger_entry','fp_product_snapshot','fp_load_log'] loop
+    execute format('alter table dash.%I disable row level security', t);
+  end loop; end $$;
+
+-- dash_017_refresh_state_brand_default rollback (brand_id stays NOT NULL; the three refresh writers will fail again until they pass brand_id)
+alter table dash.refresh_table_state alter column brand_id drop default;

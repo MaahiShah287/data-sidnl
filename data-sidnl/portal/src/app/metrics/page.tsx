@@ -38,8 +38,9 @@ export default async function MetricsPage({ searchParams }: { searchParams?: SP 
       </div>
 
       <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800 space-y-1">
-        <p>Applied 2026-11-13: pipeline fix (silver_075, silver_076), competitor tables (dash_013) and their cron job (dash_014). Scraped figures are current for Blinkit and Zepto;
-           Zepto first-party data (sales, ads) has not been delivered yet.</p>
+        <p>Applied 2026-11-13: pipeline fix (silver_075, silver_076), competitor tables (dash_013) and their cron job (dash_014). Scraped figures are current for Blinkit and Zepto.
+           Zepto first-party exports (sales, stock, PO, GRN, invoices, payments, ledger, ad console) are loaded (dash.fp_*, views in dash_016) and shown on the Sales, Supply,
+           Finance and Ads pages. The Blinkit ad exports were removed from the database, so keyword- and campaign-level ad metrics are not available.</p>
         <p>No sales, GMV, inventory, ads or finance number is ever estimated from scraped prices; those rows are shown as not available.</p>
       </div>
 

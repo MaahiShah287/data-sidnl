@@ -3,7 +3,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard, TrendingUp, Tag, CheckCircle,
-  Eye, Swords, Megaphone, ListChecks
+  Eye, Swords, Megaphone, ListChecks, ShoppingCart, Truck, Receipt
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -13,6 +13,9 @@ const NAV = [
   { href: '/pricing',      label: 'Pricing',         icon: Tag },
   { href: '/visibility',   label: 'Visibility',      icon: Eye },
   { href: '/competitors',  label: 'Competitors',     icon: Swords },
+  { href: '/sales',        label: 'Sales',           icon: ShoppingCart },
+  { href: '/supply',       label: 'Supply',          icon: Truck },
+  { href: '/finance',      label: 'Finance',         icon: Receipt },
   { href: '/ads',          label: 'Ads',             icon: Megaphone },
   { href: '/metrics',      label: 'Metric coverage', icon: ListChecks },
 ];
