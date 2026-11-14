@@ -101,11 +101,36 @@ coverage as availability.
 
 ## Dates, cities and platforms in Gold
 
-The Gold date column is `obs_date` (`sales_date` for first-party sales, `day`
-for the ad wallet, `as_of` for summaries). `city_slug` is a slug, not the
-display name; resolve it through `dash.dim_city`. The pseudo-city `'ALL'` is an
-all-city roll-up — use it only for totals and never add it to individual city
-rows. Platform values are lowercase: `'blinkit'` and `'zepto'`.
+There is no single Gold date column. **Each relation has its own**, and some
+have none at all. Always check the relation you are reading:
+
+| Date column | Relations |
+|---|---|
+| `obs_date` | `availability`, `pricing`, `visibility`, `coverage`, `comp_brand_day`, `comp_sku_day`, `v_brand_scorecard`, `v_brand_scorecard_latest`, `v_comp_price_gap`, `v_comp_sku_day`, `v_chatbot_availability_city` |
+| `sales_date` | `fp_sales_daily`, `v_fp_sales_day` |
+| `day` | **`v_fp_ad_wallet_day` only** |
+| `month` | `v_fp_sales_month`, `v_fp_po_month`, `v_fp_debit_note_month` |
+| `as_of` | `v_fp_finance_summary`, `v_fp_sales_health` |
+| `snapshot_at` | `v_fp_sku_stock`, `fp_product_snapshot` |
+| `period_start` / `period_end` | `v_workspace_sov_keyword` |
+| `date_from` / `date_to` | `fp_fill_rate`, `fp_new_user_share` |
+| `po_date` | `fp_po`, `v_fp_po_summary`, `v_fp_po_line_all` |
+| `invoice_date` | `v_fp_invoice_recon` |
+| `cost_date` | `v_fp_sku_cost` |
+| `last_sale` | `v_fp_sales_sku` |
+| `last_data_at` | `v_platform_freshness` |
+
+**No date column at all:** `v_fp_ad_page`, `fp_ad_page_perf`,
+`v_fp_sales_city`, `v_fp_po_sku`, `v_fp_po_status`, `v_comp_cross_marketplace`,
+`metric_catalog`, and every `dim_*` relation except `dim_date.date_key`.
+`v_fp_ad_page.snapshot_label` is a text label, not a date. If a relation has no
+date column, aggregate across all rows; never invent `day`, `date` or
+`report_date`. The chatbot rejects such SQL before it reaches Postgres.
+
+`city_slug` is a slug, not the display name; resolve it through `dash.dim_city`.
+The pseudo-city `'ALL'` is an all-city roll-up — use it only for totals and never
+add it to individual city rows. Platform values are lowercase: `'blinkit'` and
+`'zepto'`.
 
 ## Data freshness
 

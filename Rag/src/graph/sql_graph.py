@@ -372,6 +372,13 @@ Fix the SQL so it is a single SELECT over the allowlisted relations only:
           city-level availability)
 Never reference silver.demo, base scraped tables (silver.blinkit / zepto /
 instamart / jiomart) or the app / ops / auth / storage schemas.
+
+If the error says a column does not exist:
+- use ONLY the real date columns the error lists for that relation;
+- if the relation has no date column (e.g. dash.v_fp_ad_page, dash.fp_ad_page_perf,
+  dash.v_fp_sales_city), do NOT add `day`, `date`, `report_date` or `obs_date` —
+  aggregate across all rows and group by snapshot_label / page_name / city instead.
+- never reintroduce the column that caused the error.
 Output JSON only: {{"sql": "<fixed query>"}}"""
 
     llm = _llm()

@@ -148,3 +148,85 @@ class TestEdgeCases:
         _bad("SELECT * FROM silver.fact_product_reading", "not in the allowlist")
         _bad("SELECT * FROM silver.fact_store_scan", "not in the allowlist")
         _bad("SELECT * FROM app.tenants", "not in the allowlist")
+
+class TestDashDateColumns:
+    """The planner must never invent a date column on a Gold relation."""
+
+    def test_day_rejected_on_ad_page(self):
+        err = _bad(
+            "SELECT day, SUM(spend) AS spend FROM dash.v_fp_ad_page GROUP BY day",
+            "v_fp_ad_page",
+        )
+        assert "no date column" in err.lower()
+
+    def test_report_date_rejected_on_ad_page(self):
+        _bad("SELECT report_date FROM dash.v_fp_ad_page", "v_fp_ad_page")
+
+    def test_obs_date_rejected_on_ad_page(self):
+        _bad("SELECT obs_date FROM dash.v_fp_ad_page", "v_fp_ad_page")
+
+    def test_aliased_day_rejected(self):
+        _bad("SELECT a.day FROM dash.v_fp_ad_page AS a", "v_fp_ad_page")
+
+    def test_month_rejected_on_availability(self):
+        _bad("SELECT month FROM dash.availability", "availability")
+
+    def test_sales_date_rejected_on_availability(self):
+        _bad("SELECT sales_date FROM dash.availability", "availability")
+
+    def test_day_allowed_on_ad_wallet(self):
+        assert _ok(
+            "SELECT day, SUM(ad_spend) FROM dash.v_fp_ad_wallet_day GROUP BY day"
+        )
+
+    def test_sales_date_allowed_on_sales_day(self):
+        assert _ok(
+            "SELECT sales_date, SUM(gmv) FROM dash.v_fp_sales_day "
+            "GROUP BY sales_date"
+        )
+
+    def test_obs_date_allowed_on_availability_city(self):
+        assert _ok(
+            "SELECT obs_date, SUM(osa_available_obs) "
+            "FROM dash.v_chatbot_availability_city GROUP BY obs_date"
+        )
+
+    def test_month_allowed_on_sales_month(self):
+        assert _ok(
+            "SELECT month, SUM(gmv) FROM dash.v_fp_sales_month GROUP BY month"
+        )
+
+    def test_as_of_allowed_on_finance_summary(self):
+        assert _ok("SELECT as_of, invoice_value FROM dash.v_fp_finance_summary")
+
+    def test_snapshot_at_allowed_on_sku_stock(self):
+        assert _ok("SELECT snapshot_at, stock_on_hand FROM dash.v_fp_sku_stock")
+
+    def test_date_trunc_day_is_not_a_column(self):
+        assert _ok("SELECT date_trunc('day', obs_date) AS d FROM dash.availability")
+
+    def test_extract_day_is_not_a_column(self):
+        assert _ok("SELECT EXTRACT(day FROM obs_date) AS d FROM dash.availability")
+
+    def test_select_alias_named_day_is_allowed(self):
+        assert _ok(
+            "SELECT snapshot_label AS day FROM dash.v_fp_ad_page GROUP BY day"
+        )
+
+    def test_snapshot_columns_without_date_allowed(self):
+        assert _ok(
+            "SELECT snapshot_label, page_name, spend, roas "
+            "FROM dash.v_fp_ad_page ORDER BY spend DESC"
+        )
+
+    def test_select_star_allowed(self):
+        assert _ok("SELECT * FROM dash.v_fp_ad_page")
+
+    def test_join_across_dash_relations(self):
+        assert _ok(
+            "SELECT a.obs_date, c.city_name FROM dash.availability a "
+            "JOIN dash.dim_city c ON c.city_slug = a.city_slug"
+        )
+
+    def test_silver_unaffected(self):
+        assert _ok("SELECT id FROM silver.v_latest_observation")

@@ -95,9 +95,11 @@ Time: observed_at, scraped_at
 **First-party ads**
 - `dash.v_fp_ad_page` — snapshot_label, page_name, impressions, clicks, atc,
   orders, revenue, spend, ctr_pct, cpc, cpm, cvr_pct, roas, acos_pct,
-  same_skus, other_skus
-- `dash.v_fp_ad_wallet_day` — day, ad_spend, topup, incentive, refunds
-- `dash.fp_ad_page_perf` — raw ad page rows
+  same_skus, other_skus. **NO date column** — `snapshot_label` is a label, not
+  a date. Aggregate across all rows; group by `snapshot_label` / `page_name`.
+- `dash.v_fp_ad_wallet_day` — day (a real `date`), ad_spend, topup, incentive,
+  refunds
+- `dash.fp_ad_page_perf` — raw ad page rows (also no date column)
 
 **Supply chain / finance**
 - `dash.fp_fill_rate` — week_no, date_from, date_to, brand_name, city,
@@ -135,10 +137,41 @@ Time: observed_at, scraped_at
   size_unit, category_path)
 - `dash.dim_product`, `dash.dim_category`, `dash.dim_date`
 
+## DATE COLUMNS ARE PER-RELATION (authoritative, from information_schema)
+
+Never assume a date column exists. Use only the column listed for the relation
+you are reading. If the relation has no date column, aggregate across all rows
+and do not filter or group by date.
+
+- `obs_date`: availability, pricing, visibility, coverage, comp_brand_day,
+  comp_sku_day, v_brand_scorecard, v_brand_scorecard_latest, v_comp_price_gap,
+  v_comp_sku_day, v_chatbot_availability_city
+- `sales_date`: fp_sales_daily, v_fp_sales_day
+- `day`: **v_fp_ad_wallet_day only**
+- `month`: v_fp_sales_month, v_fp_po_month, v_fp_debit_note_month
+- `as_of`: v_fp_finance_summary, v_fp_sales_health
+- `snapshot_at`: v_fp_sku_stock, fp_product_snapshot
+- `period_start` / `period_end`: v_workspace_sov_keyword
+- `date_from` / `date_to`: fp_fill_rate, fp_new_user_share
+- `po_date`: fp_po, v_fp_po_summary, v_fp_po_line_all
+- `invoice_date`: v_fp_invoice_recon
+- `cost_date`: v_fp_sku_cost
+- `last_sale`: v_fp_sales_sku
+- `last_data_at`: v_platform_freshness
+- `last_refreshed_at` / `last_attempt_at`: v_refresh_status, refresh_table_state
+- `created_at` / `updated_at`: fp_ad_wallet_txn
+- **NO DATE COLUMN** (never filter or group by date): v_fp_ad_page,
+  fp_ad_page_perf, v_fp_sales_city, v_fp_po_sku, v_fp_po_status,
+  v_comp_cross_marketplace, metric_catalog, fp_po_line, fp_sku, fp_sku_name,
+  and every `dim_*` relation (except dim_date.date_key)
+
 ## Gold conventions (get these wrong and the answer is wrong)
 
-1. **Date column is `obs_date`** (a `date`), not `observed_at`. First-party
-   sales use `sales_date`; ads use `snapshot_label` / `day`.
+1. **Use the relation's real date column** (see DATE COLUMNS above). The default
+   scraped-Gold date is `obs_date` (a `date`), not `observed_at`. First-party
+   sales use `sales_date`; the ad wallet uses `day`; ad page performance has
+   **no** date column. Never write `day`, `date` or `report_date` on a relation
+   that does not list it.
 2. **`city_slug` is a slug, not the display name.** Resolve a city name with
    `dash.dim_city`:
    `WHERE city_slug = (SELECT city_slug FROM dash.dim_city WHERE lower(city_name) = lower('Mumbai'))`
@@ -167,6 +200,14 @@ Time: observed_at, scraped_at
    question gives a brand UUID; filter by name/key instead.
 10. **Prefer a pre-built `v_*` view** over re-deriving the same aggregate. Only
     drop to the base table when you need a column the view does not expose.
+11. **ROAS comes from one source.** Use `SUM(revenue) / SUM(spend)` on
+    `dash.v_fp_ad_page` (or its `roas` column). Do not divide page revenue by
+    wallet spend: `v_fp_ad_wallet_day` and `v_fp_ad_page` cover different
+    populations and periods.
+12. **Ad spend has two meanings.** Wallet debits
+    (`v_fp_ad_wallet_day.ad_spend`) are the money actually spent; page spend
+    (`v_fp_ad_page.spend`) is campaign-level reported spend. Use the wallet for
+    "how much did we spend", the page for campaign ROAS/CTR.
 
 ## Silver literal values (match EXACTLY; Postgres string comparison is case-sensitive)
 
@@ -199,15 +240,16 @@ Time: observed_at, scraped_at
 4. If a metric is 'draft', add a SQL comment: -- DRAFT METRIC: <definition>
 5. If a metric is 'unsupported', do NOT generate SQL. Return {"error": "unsupported metric: <name>"}
 6. Always include the scope columns for provenance: platform and city_slug
-   (Gold) or platform and city (Silver), plus obs_date / sales_date.
+   (Gold) or platform and city (Silver), plus the relation's real date column
+   (see DATE COLUMNS). If the relation has no date column, do not invent one.
 7. Add **only** the filters the question asks for. Do not invent extra filters
    (e.g. `availability = true`, a brand pattern in `product_name`, or a
    narrower city) — they silently turn a correct query into 0 rows. If the
    question names a product, DO filter on it using the `product_name`
    guidance above.
-8. If the question has no explicit date range, do not filter by date; order
-   descending and let the rows show the latest values. Do not hardcode
-   `CURRENT_DATE` (the data is scraped on its own schedule).
+8. If the question has no explicit date range, do not filter **or group** by
+   date; order descending and let the rows show the latest values. Do not
+   hardcode `CURRENT_DATE` (the data is scraped on its own schedule).
 9. Output JSON only: {"sql": "<query>"} or {"error": "<reason>"}
 
 ## User question

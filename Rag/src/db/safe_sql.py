@@ -9,6 +9,8 @@ from typing import Any
 import sqlglot
 import sqlglot.expressions as exp
 
+from db.schema_guard import find_bad_date_column
+
 # ---------------------------------------------------------------------------
 # Allowlist
 # ---------------------------------------------------------------------------
@@ -223,6 +225,26 @@ def validate_and_sanitise(raw_sql: str) -> SafeResult:
                 "src/db/safe_sql.py are readable; silver.demo, base scraped "
                 "tables and config/ops schemas are permanently excluded."
             )
+
+    bad_date = find_bad_date_column(parsed)
+    if bad_date:
+        rel, col, allowed = bad_date
+        if allowed:
+            allowed_txt = ", ".join(sorted(allowed))
+            fix = (
+                f"Use one of its real date columns: {allowed_txt}. "
+                "Never invent a date column."
+            )
+        else:
+            fix = (
+                "It has no date column at all (snapshot view). Do not filter or "
+                "group by a date on it; aggregate across all rows and group by "
+                "snapshot_label / page_name instead."
+            )
+        raise SQLValidationError(
+            f"Rejected: '{rel}' has no column '{col}'. {fix}"
+        )
+
     had_limit = _has_limit(parsed)
     if not had_limit:
         sql = f"{sql}\nLIMIT {DEFAULT_LIMIT}"

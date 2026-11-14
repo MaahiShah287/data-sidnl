@@ -676,24 +676,27 @@ metrics:
   - name: ad_spend
     layer: gold
     status: gold
-    aliases: [spend, advertising spend, ad wallet]
+    aliases: [spend, advertising spend, ad wallet, campaign spend]
     definition: >
       First-party ad spend. Two sources: dash.v_fp_ad_wallet_day.ad_spend
-      (wallet debits, the money actually spent) and dash.v_fp_ad_page.spend
-      (page-level reported spend). Prefer the wallet for "how much did we
-      spend", the page view for campaign performance.
+      (wallet debits, the money actually spent; this is the only ad relation
+      with a date column, `day`) and dash.v_fp_ad_page.spend (campaign-level
+      reported spend; v_fp_ad_page has NO date column, only snapshot_label).
+      Prefer the wallet for "how much did we spend", the page view for campaign
+      performance. If the question also asks for ROAS/CTR, take spend and
+      revenue from dash.v_fp_ad_page so both come from the same source.
+      Never put `day` on v_fp_ad_page.
     source_view: dash.v_fp_ad_wallet_day
     sql_template: |
+      -- Total spend across all wallet days. Add `day` + GROUP BY day ONLY when
+      -- the question asks for a daily trend; never use `day` on v_fp_ad_page.
       SELECT
-        day,
         ROUND(SUM(ad_spend), 2) AS ad_spend,
         ROUND(SUM(topup), 2)    AS topup,
         ROUND(SUM(refunds), 2)  AS refunds
       FROM dash.v_fp_ad_wallet_day
       WHERE 1=1
         {where_clauses}
-      GROUP BY day
-      ORDER BY day DESC
     grain: brand x day
     required_filters: []
     open_questions: []
@@ -701,11 +704,15 @@ metrics:
   - name: ad_performance
     layer: gold
     status: gold
-    aliases: [roas, ctr, cpc, cpm, cvr, acos, clicks, impressions, conversion rate]
+    aliases: [roas, ctr, cpc, cpm, cvr, acos, clicks, impressions, conversion rate,
+              campaign, campaigns, ad campaign]
     definition: >
       Ad page performance from dash.v_fp_ad_page: impressions, clicks, atc,
       orders, revenue, spend, and the derived ctr_pct, cpc, cpm, cvr_pct,
-      roas, acos_pct. One row per snapshot_label x page_name.
+      roas, acos_pct. One row per snapshot_label x page_name. This view has NO
+      date column: never filter or group by `day`, `date` or `obs_date`.
+      ROAS is SUM(revenue)/SUM(spend) on this same view; do not divide page
+      revenue by wallet spend.
     source_view: dash.v_fp_ad_page
     sql_template: |
       SELECT
@@ -736,7 +743,9 @@ metrics:
     aliases: [return on ad spend, robas]
     definition: >
       ROAS = revenue / spend, from dash.v_fp_ad_page.roas. Only defined where
-      both ad revenue and spend are present; NULL means not measurable.
+      both ad revenue and spend are present; NULL means not measurable. Use
+      SUM(revenue)/SUM(spend) for a roll-up. v_fp_ad_page has NO date column, so
+      never filter or group by `day`; aggregate across all snapshots.
     source_view: dash.v_fp_ad_page
     sql_template: |
       SELECT

@@ -90,8 +90,11 @@ source columns).
   `'Mr. Munchies Cheese Chilli Samosa (Frozen)'` — match with `ILIKE '%…%'`,
   not `=`.
 - `availability` is a boolean and is NULL for some rows.
-- Gold's date column is `obs_date` (`sales_date` / `day` / `as_of` for
-  first-party tables), not `observed_at`.
+- Gold date columns are **per relation**: `obs_date` on the scraped views,
+  `sales_date` on first-party sales, `day` only on `v_fp_ad_wallet_day`,
+  `as_of`/`month`/`snapshot_at` where they exist. `v_fp_ad_page` and
+  `fp_ad_page_perf` have **no** date column. Never assume `day` or
+  `observed_at`.
 - `dash.availability` mixes city totals (`store_key IS NULL`) with per-dark-store
   rows. Summing both double-counts. The chatbot uses
   `dash.v_chatbot_availability_city`, which only exposes city totals.
@@ -225,8 +228,15 @@ The planner prompt contains:
 - the exact Silver literal values (lowercase platforms, the 11 city spellings,
   brand examples) and the rule: *only add filters the question asks for*;
 - the full Gold relation map (tables, views, columns) and the Gold conventions
-  (`obs_date`, `city_slug` vs `dim_city`, `SUM(num)/SUM(den)`, `store_key IS
-  NULL`, lowercase platform, SOV ≠ SOH, `fp_*` vs scraped);
+  (`city_slug` vs `dim_city`, `SUM(num)/SUM(den)`, `store_key IS NULL`,
+  lowercase platform, SOV ≠ SOH, `fp_*` vs scraped, ROAS from one source);
+- a **per-relation date-column table** generated from `information_schema`:
+  `obs_date` on the scraped views, `sales_date` on first-party sales, `day`
+  **only** on `v_fp_ad_wallet_day`, `month`/`as_of`/`snapshot_at` where they
+  exist, and an explicit *no date column* list (`v_fp_ad_page`,
+  `fp_ad_page_perf`, `v_fp_sales_city`, …). The planner must use the relation's
+  real date column and, when there is none, aggregate across all rows instead
+  of inventing `day`;
 - the **full SQL template for the metric(s) the question names**, plus a compact
   index of every other metric;
 - `dash.metric_catalog` rendered at plan time (cached for 15 minutes), so all
@@ -250,7 +260,12 @@ HTTP 413.
    and views (`SILVER_RELATIONS | GOLD_TABLES | GOLD_DIMENSIONS | GOLD_VIEWS`).
    `silver.demo`, the base scraped tables, and the `app`/`ops`/`auth`/`storage`
    schemas are permanently excluded;
-5. appends `LIMIT 200` if no limit is present.
+5. **rejects impossible date columns** on `dash.*` relations
+   (`src/db/schema_guard.py`). The exact column list is generated from
+   `information_schema` into `src/db/dash_schema.py`, so `day` on
+   `dash.v_fp_ad_page` is rejected before Postgres sees it, and the model is
+   told the relation's real date columns (or that it has none);
+6. appends `LIMIT 200` if no limit is present.
 
 **execute_sql** — `src/db/client.py` runs the query through a connection pool
 whose connections are created with:
@@ -364,6 +379,7 @@ DEFINITION path stays on documentation.
 | Route classification | `src/graph/router.py` | refusing a supported Gold KPI, or answering genuinely absent data (ETA/Instamart/JioMart/industry share) with a guess |
 | SQL keyword blocklist | `src/db/safe_sql.py` | writes, DDL, file/system functions |
 | Relation allowlist | `src/db/safe_sql.py` | reading `silver.demo`, base scraped tables, or non-curated `dash.*` relations |
+| Date-column guard | `src/db/schema_guard.py` | inventing a date column (`day`, `report_date`, …) on a Gold relation that has none; the real column list comes from `information_schema` |
 | Single-statement rule | `src/db/safe_sql.py` | SQL injection via `;` |
 | Auto `LIMIT 200` | `src/db/safe_sql.py` | accidental full-table dumps |
 | Read-only transactions | `src/db/client.py` | any write at the database level |
@@ -532,7 +548,7 @@ select count(*) from dash.v_chatbot_availability_city;  -- city-total rows only
 ### Verify the install
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q          # 83 tests
+.\.venv\Scripts\python.exe -m pytest -q          # 102 tests
 .\.venv\Scripts\python.exe -m compileall -q src eval scripts tests
 ```
 
@@ -567,6 +583,7 @@ Interactive docs are at `http://127.0.0.1:8000/docs`.
 | Script | Purpose |
 |---|---|
 | `scripts/profile_data.py` | Stage A data profiler |
+| `scripts/dump_dash_schema.py` | regenerate `src/db/dash_schema.py` (exact `dash.*` columns + date map) from `information_schema` |
 | `scripts/run_ground_truth.py` | capture ground-truth values for eval questions |
 | `eval/rescore.py` | re-score saved results without calling the API |
 
@@ -588,6 +605,8 @@ Rag/
 │   │   └── state.py           shared ChatState schema
 │   ├── db/
 │   │   ├── safe_sql.py        SQL firewall / Silver+Gold allowlist / LIMIT injection
+│   │   ├── schema_guard.py    rejects impossible date columns on dash.* relations
+│   │   ├── dash_schema.py     generated: exact dash.* columns + date-column map
 │   │   └── client.py          read-only pool, 10 s timeout, bulk connection
 │   ├── retrieval/
 │   │   ├── hybrid.py          Chroma + BM25 + RRF
@@ -598,7 +617,7 @@ Rag/
 ├── metrics/                   metric_dictionary.yaml, status_vocabulary.md,
 │                              gold_layer.md (Gold definitions for DEFINITION Qs)
 ├── reports/                   committed markdown evidence (bulk output ignored)
-├── tests/                     83 tests
+├── tests/                     102 tests
 └── sql/                       reference SQL
     ├── 01_views.sql           Silver views + Gold map + availability_city view
     ├── 03_roles.sql           canonical Silver+Gold grants, revokes, timeouts
@@ -643,6 +662,20 @@ Check `metric_status`:
   `blocked`, the number is not the final KPI and `missing_inputs` says why.
 - `draft` — usable but flagged with a banner; the definition may still change.
 - `unsupported` — must not be answered with SQL.
+
+**A Gold query fails with `column "day" does not exist` (or `report_date`,
+`obs_date`, …).**
+The planner invented a date column on a relation that has none. Check the SQL
+against the date map in §6 / `metrics/gold_layer.md`: `day` exists **only** on
+`dash.v_fp_ad_wallet_day`, `obs_date` only on the scraped views, `sales_date`
+only on first-party sales. `dash.v_fp_ad_page` and `dash.fp_ad_page_perf` have
+**no** date column (`snapshot_label` is a label, not a date), so aggregate
+across all rows. `src/db/schema_guard.py` should reject this before Postgres;
+if a new Gold view is added, regenerate the map:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\dump_dash_schema.py
+```
 
 **Every Gold query fails with `permission denied for schema dash`.**
 The read-only role has no `USAGE` on `dash` yet. Run
