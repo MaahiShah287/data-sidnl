@@ -30,7 +30,7 @@ class ChatState(TypedDict, total=False):
 
     # Numeric path
     metric_name: str | None
-    metric_status: str | None         # 'approved'|'draft'|'unsupported'|None
+    metric_status: str | None         # 'approved'|'draft'|'gold'|'unsupported'|None
     metric_definition: str | None
     generated_sql: str | None
     sanitised_sql: str | None

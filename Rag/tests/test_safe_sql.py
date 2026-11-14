@@ -117,8 +117,34 @@ class TestEdgeCases:
     def test_pg_sleep_subquery(self):     _bad("SELECT (SELECT pg_sleep(5)) FROM silver.v_latest_observation", "pg_sleep")
     def test_dblink_blocked(self):        _bad("SELECT dblink('host=x','SELECT 1')", "dblink")
     def test_allowlist_complete(self):
-        assert ALLOWLISTED_RELATIONS == frozenset({
+        from db.safe_sql import (
+            GOLD_DIMENSIONS, GOLD_TABLES, GOLD_VIEWS, SILVER_RELATIONS,
+        )
+
+        assert SILVER_RELATIONS == frozenset({
             "silver.v_all_platforms",
             "silver.v_latest_observation",
             "silver.v_latest_shelf_position",
         })
+        assert ALLOWLISTED_RELATIONS == (
+            SILVER_RELATIONS | GOLD_TABLES | GOLD_DIMENSIONS | GOLD_VIEWS
+        )
+        # Gold (dash) is part of the allowlist.
+        assert "dash.availability" in ALLOWLISTED_RELATIONS
+        assert "dash.metric_catalog" in ALLOWLISTED_RELATIONS
+        assert "dash.v_chatbot_availability_city" in ALLOWLISTED_RELATIONS
+
+    def test_gold_relations_accepted(self):
+        assert _ok("SELECT osa_pct FROM dash.v_chatbot_availability_city")
+        assert _ok("SELECT sum(gmv) FROM dash.v_fp_sales_day")
+        assert _ok("SELECT count(*) FROM dash.metric_catalog")
+        assert _ok(
+            "SELECT a.osa_pct FROM dash.availability a "
+            "JOIN dash.dim_city c ON c.city_slug = a.city_slug "
+            "WHERE a.store_key IS NULL"
+        )
+
+    def test_gold_base_scraped_tables_still_blocked(self):
+        _bad("SELECT * FROM silver.fact_product_reading", "not in the allowlist")
+        _bad("SELECT * FROM silver.fact_store_scan", "not in the allowlist")
+        _bad("SELECT * FROM app.tenants", "not in the allowlist")

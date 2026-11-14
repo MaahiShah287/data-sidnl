@@ -9,11 +9,97 @@ from typing import Any
 import sqlglot
 import sqlglot.expressions as exp
 
-ALLOWLISTED_RELATIONS: frozenset[str] = frozenset({
+# ---------------------------------------------------------------------------
+# Allowlist
+# ---------------------------------------------------------------------------
+# Two layers are readable:
+#   * Silver — raw, quality-filtered SKU x store readings (price, stock, shelf).
+#   * Gold (dash) — pre-aggregated dashboard tables/views (OSA, SOV, pricing
+#     parity, competitor layer, first-party sales/ads/finance).
+#
+# The database grant is deliberately broad (SELECT on the whole dash schema);
+# THIS set is the real guardrail. Anything not listed here is rejected before
+# it reaches Postgres. Keep it curated: adding a relation means the planner can
+# use it and the model may see its columns.
+
+SILVER_RELATIONS: frozenset[str] = frozenset({
     "silver.v_all_platforms",
     "silver.v_latest_observation",
     "silver.v_latest_shelf_position",
 })
+
+# Gold fact tables (daily aggregates, one row per grain in the comment).
+GOLD_TABLES: frozenset[str] = frozenset({
+    "dash.availability",        # SKU x city x day OSA/inventory; store_key NULL = city total
+    "dash.pricing",             # SKU x city x day MRP/SP/discount + parity
+    "dash.visibility",          # SKU x category/keyword x day rank/impressions/SOV
+    "dash.coverage",            # day x platform x city serviceability
+    "dash.comp_brand_day",      # competitor brand x category x city x day
+    "dash.comp_sku_day",        # competitor SKU x city x day
+    "dash.fp_sales_daily",      # first-party sales: date x SKU x city (GMV, units)
+    "dash.fp_ad_page_perf",     # first-party ad page: impressions/clicks/orders/spend
+    "dash.fp_ad_wallet_txn",    # first-party ad wallet debits/credits
+    "dash.fp_fill_rate",        # weekly quantity/line fill rate
+    "dash.fp_sku",              # first-party SKU master
+    "dash.fp_sku_name",         # first-party SKU -> name
+    "dash.fp_product_snapshot", # first-party product snapshot (stock, GMV, growth)
+    "dash.metric_catalog",      # authoritative metric list: formula/status/gold_table
+    "dash.refresh_table_state", # Gold refresh status per table
+    "dash.fp_po",               # purchase orders
+    "dash.fp_po_line",          # purchase order lines
+    "dash.fp_grn_line",         # goods receipt lines (ASN/GRN/invoice)
+    "dash.fp_invoice",          # invoices
+    "dash.fp_payment_advice",   # payment advices
+    "dash.fp_debit_credit_note",# debit / credit notes
+    "dash.fp_ledger_entry",     # ledger entries / running balance
+    "dash.fp_new_user_share",   # new-user share by month
+})
+
+GOLD_DIMENSIONS: frozenset[str] = frozenset({
+    "dash.dim_brand",
+    "dash.dim_city",        # city_slug + city_name; pseudo-city 'ALL'
+    "dash.dim_platform",
+    "dash.dim_store",
+    "dash.dim_sidnl",       # sidnl_id -> canonical product
+    "dash.dim_product",
+    "dash.dim_category",
+    "dash.dim_date",
+})
+
+# Pre-built Gold views. Prefer these over re-deriving the same aggregate.
+GOLD_VIEWS: frozenset[str] = frozenset({
+    "dash.v_brand_scorecard",
+    "dash.v_brand_scorecard_latest",
+    "dash.v_comp_price_gap",
+    "dash.v_comp_sku_day",
+    "dash.v_comp_cross_marketplace",
+    "dash.v_fp_sales_day",
+    "dash.v_fp_sales_sku",
+    "dash.v_fp_sales_city",
+    "dash.v_fp_sales_month",
+    "dash.v_fp_sales_health",
+    "dash.v_fp_ad_page",
+    "dash.v_fp_ad_wallet_day",
+    "dash.v_fp_sku_stock",
+    "dash.v_fp_sku_cost",
+    "dash.v_fp_po_summary",
+    "dash.v_fp_po_status",
+    "dash.v_fp_po_month",
+    "dash.v_fp_po_sku",
+    "dash.v_fp_po_line_all",
+    "dash.v_fp_invoice_recon",
+    "dash.v_fp_finance_summary",
+    "dash.v_fp_debit_note_month",
+    "dash.v_workspace_sov_keyword",
+    "dash.v_refresh_status",
+    "dash.v_data_freshness",
+    "dash.v_platform_freshness",
+    "dash.v_chatbot_availability_city",  # city-level only (store_key IS NULL)
+})
+
+ALLOWLISTED_RELATIONS: frozenset[str] = (
+    SILVER_RELATIONS | GOLD_TABLES | GOLD_DIMENSIONS | GOLD_VIEWS
+)
 
 _BLOCKED: list[re.Pattern] = [
     re.compile(r"\bINSERT\b",        re.IGNORECASE),
@@ -132,8 +218,10 @@ def validate_and_sanitise(raw_sql: str) -> SafeResult:
     for r in rels:
         if r not in ALLOWLISTED_RELATIONS:
             raise SQLValidationError(
-                f"Rejected: '{r}' not in the allowlist {sorted(ALLOWLISTED_RELATIONS)}. "
-                "silver.demo and base tables are permanently excluded."
+                f"Rejected: '{r}' not in the allowlist. "
+                "Only the curated Silver views and Gold (dash) tables/views in "
+                "src/db/safe_sql.py are readable; silver.demo, base scraped "
+                "tables and config/ops schemas are permanently excluded."
             )
     had_limit = _has_limit(parsed)
     if not had_limit:

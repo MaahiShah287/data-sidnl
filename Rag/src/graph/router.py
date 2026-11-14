@@ -5,6 +5,7 @@ Classifies the user's question into NUMERIC | DEFINITION | UNSUPPORTED | AMBIGUO
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -18,11 +19,34 @@ from graph.state import ChatState
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "router_system.md"
 _ROUTER_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8")
 
-# Hard-coded pattern overrides (belt-and-suspenders before the LLM call)
-_UNSUPPORTED_KEYWORDS = {
-    "sales", "revenue", "units sold", "ad spend", "roas", "conversion",
-    "clicks", "impressions", "ctr", "sov", "share of voice",
-    "soh", "share of shelf",
+# Hard-coded pattern overrides (belt-and-suspenders before the LLM call).
+# Only data that is GENUINELY absent may short-circuit to UNSUPPORTED. Gold
+# KPIs (sales, GMV, SOV, SOH, ROAS, clicks, impressions, …) are supported and
+# must go through the normal NUMERIC path.
+_UNSUPPORTED_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\binstamart\b"), "instamart"),
+    (re.compile(r"\bjio\s*mart\b"), "jiomart"),
+    (
+        re.compile(r"\bdelivery\s*(?:eta|time|minutes?)\b|\beta\b"),
+        "delivery ETA",
+    ),
+    (
+        re.compile(
+            r"\b(?:industry|total)\s+market\s+(?:share|size)\b"
+            r"|\bmarket\s+size\b|\bcategory\s+size\b"
+        ),
+        "industry market share",
+    ),
+]
+
+# If a question names a metric, "tell me about X" is answerable, not vague.
+_METRIC_HINTS = {
+    "sales", "revenue", "gmv", "units", "asp", "osa", "availability",
+    "listing", "stockout", "soh", "share of shelf", "sov", "share of voice",
+    "discount", "price", "parity", "roas", "ad spend", "clicks",
+    "impressions", "ctr", "cpc", "cpm", "cvr", "conversion", "fill rate",
+    "serviceab", "invoice", "pending", "stock", "inventory", "rank",
+    "freshness", "doi",
 }
 
 _CLARIFY_TRIGGERS = {
@@ -43,22 +67,26 @@ def _build_llm() -> ChatOpenAI:
 
 def _keyword_override(question: str) -> dict | None:
     q_lower = question.lower()
-    for kw in _UNSUPPORTED_KEYWORDS:
-        if kw in q_lower:
+
+    for pattern, label in _UNSUPPORTED_PATTERNS:
+        if pattern.search(q_lower):
             return {
                 "route": "UNSUPPORTED",
                 "confidence": 0.99,
-                "reason": f"Question mentions '{kw}' which is not in the SIDNL data.",
+                "reason": f"Question asks for {label}, which is not in Silver or Gold.",
                 "detected_language": _detect_lang(question),
             }
-    for trigger in _CLARIFY_TRIGGERS:
-        if trigger in q_lower:
-            return {
-                "route": "AMBIGUOUS",
-                "confidence": 0.9,
-                "reason": "Question is too vague; a clarifying question is needed.",
-                "detected_language": _detect_lang(question),
-            }
+
+    names_metric = any(hint in q_lower for hint in _METRIC_HINTS)
+    if not names_metric:
+        for trigger in _CLARIFY_TRIGGERS:
+            if trigger in q_lower:
+                return {
+                    "route": "AMBIGUOUS",
+                    "confidence": 0.9,
+                    "reason": "Question is too vague; a clarifying question is needed.",
+                    "detected_language": _detect_lang(question),
+                }
     return None
 
 

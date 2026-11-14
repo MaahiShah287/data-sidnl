@@ -29,26 +29,57 @@ Abstaining is a correct answer. Making up a number is not.
 
 This is intentionally narrow. Do not expect the bot to answer everything.
 
+Two layers are queryable. **Gold (`dash`) is authoritative for KPIs; Silver is
+for the individual raw reading.**
+
+| Layer | What it holds | Use it for |
+|---|---|---|
+| **Silver** | raw, quality-filtered SKU × store readings: price, availability, discount, shelf position, ads | "what is the price / stock / shelf position of this SKU at this store right now" |
+| **Gold (`dash`)** | pre-aggregated dashboard tables and views, built from Silver by the Gold refresh | any KPI: OSA, listing, stockouts, DOI, price parity, SOH, SOV, rank, GMV/units/ASP/growth, ad spend/ROAS/ACOS, fill rate, PO/invoice value, serviceability, freshness |
+
+Silver coverage:
+
 | Data | Platform | Scope |
 |---|---|---|
 | Price, availability, discount | **Blinkit** | Brand **Mr. Munchies** only |
 | Shelf position, organic position, ads | **Blinkit** | Brands **Amul** and **Mr. Munchies** |
 | Shelf position, organic position, ads | **Zepto** | **Mumbai only** |
-| Instamart / JioMart | — | **No rows at all** |
-| Delivery ETA | — | Column exists but is **NULL in every row** |
-| Sales, revenue, ROAS, clicks, impressions, CTR, SOV, SOH | — | **Not available** |
 
-Cities present in the data (11):
+Gold coverage (all in `dash`):
+
+| Area | Tables / views | Metrics |
+|---|---|---|
+| Availability / OSA | `availability`, `v_chatbot_availability_city` | OSA %, listing %, in/out-of-stock stores, DOI, potential sales loss |
+| Pricing / parity | `pricing`, `v_comp_price_gap`, `v_comp_cross_marketplace` | MRP, SP, discount %, parity break, cross-platform gap, price index |
+| Visibility / SOV / SOH | `visibility`, `v_brand_scorecard`, `v_brand_scorecard_latest`, `comp_brand_day` | share of voice, share of shelf, shelf rank, impressions |
+| Competitor layer | `comp_brand_day`, `comp_sku_day`, `v_comp_sku_day` | competitor price/availability/shelf |
+| First-party sales | `fp_sales_daily`, `v_fp_sales_day/_sku/_city/_month/_health` | GMV, units, ASP, 28-day growth |
+| First-party ads | `fp_ad_page_perf`, `v_fp_ad_page`, `v_fp_ad_wallet_day` | impressions, clicks, CTR, CPC, CPM, CVR, spend, ROAS, ACOS |
+| Supply chain / finance | `fp_fill_rate`, `fp_po`, `fp_po_line`, `fp_grn_line`, `fp_invoice`, `v_fp_po_summary`, `v_fp_finance_summary` | fill rate, PO value/shortfall, invoice/pending value |
+| Coverage / freshness | `coverage`, `v_platform_freshness`, `v_refresh_status` | serviceability, data freshness |
+
+**Genuinely unavailable:** delivery ETA (column exists but is NULL in every
+row), Instamart, JioMart, and industry market share / total category size.
+
+Cities present in Silver (11):
 `Ahmedabad`, `Bengaluru`, `Chennai`, `Delhi`, `Gurugram`, `Hyderabad`,
 `Kolkata`, `Mumbai`, `Navi Mumbai`, `Pune`, `Thane`.
+Gold uses `city_slug` (resolve it through `dash.dim_city`); the pseudo-city
+`'ALL'` is an all-city roll-up and must never be added to city rows. Platform
+values are lowercase in both layers.
 
-Three read-only Postgres views back everything:
+Three read-only Postgres views back the Silver path:
 
 | View | Rows | Grain |
 |---|---|---|
 | `silver.v_all_platforms` | ~56,249 | every row, both source types, quality-filtered |
 | `silver.v_latest_observation` | ~5,055 | latest price/availability/discount per listing+store |
 | `silver.v_latest_shelf_position` | ~33,991 | latest shelf position/ad data per listing+store |
+
+The Gold path reads the curated `dash.*` tables/views directly. `dash` has 30
+tables and 25 views; `sql/01_views.sql` documents the map and
+`dash.metric_catalog` is the authoritative 57-metric list (formula, status,
+source columns).
 
 **Storage quirks that matter when writing SQL:**
 
@@ -59,6 +90,14 @@ Three read-only Postgres views back everything:
   `'Mr. Munchies Cheese Chilli Samosa (Frozen)'` — match with `ILIKE '%…%'`,
   not `=`.
 - `availability` is a boolean and is NULL for some rows.
+- Gold's date column is `obs_date` (`sales_date` / `day` / `as_of` for
+  first-party tables), not `observed_at`.
+- `dash.availability` mixes city totals (`store_key IS NULL`) with per-dark-store
+  rows. Summing both double-counts. The chatbot uses
+  `dash.v_chatbot_availability_city`, which only exposes city totals.
+- Gold percentages must roll up as `SUM(numerator) / SUM(denominator)`, never
+  `AVG(pct)`. Brand-level SOV is `SUM(brand SKU impressions) / SUM(market
+  impressions)`, never an average of `share_of_voice_pct`.
 
 ---
 
@@ -86,6 +125,11 @@ Three read-only Postgres views back everything:
 
 Every response also carries `abstain_reason` (why it refused, if it did),
 `latency_ms`, and a per-node `trace` so you can see where time went.
+
+The **NUMERIC** subgraph queries both layers: Silver for raw readings, Gold
+(`dash`) for KPIs. Gold KPIs (sales, SOV, SOH, ROAS, clicks, impressions, …) are
+no longer sent to `UNSUPPORTED`; only delivery ETA, Instamart, JioMart and
+industry market share are.
 
 ---
 
@@ -129,19 +173,29 @@ four routes. The prompt lives in `src/prompts/router_system.md`.
 
 | Route | Meaning | Example |
 |---|---|---|
-| `NUMERIC` | a number/rate/comparison/list answerable from the views | "How many Blinkit stores in Chennai have Mr. Munchies out of stock?" |
-| `DEFINITION` | asks what something means | "What does draft status mean for a metric?" |
-| `UNSUPPORTED` | asks for data SIDNL does not have | "What was Zepto's revenue last quarter?" |
+| `NUMERIC` | a number/rate/comparison/list answerable from Silver or Gold | "What was our GMV last month?" |
+| `DEFINITION` | asks what something means | "What is the difference between SOV and SOH?" |
+| `UNSUPPORTED` | asks for data SIDNL does not have | "What is the delivery ETA on Blinkit?" |
 | `AMBIGUOUS` | too vague to answer without clarification | "How is Blinkit doing?" |
 
-Rules encoded in the router prompt:
+Rules encoded in the router prompt (`src/prompts/router_system.md`, v2.0):
 
-- Delivery ETA questions → `UNSUPPORTED` (the column is empty).
-- Any Instamart/JioMart question → `UNSUPPORTED` (no rows).
-- Sales, revenue, ad spend, ROAS, conversion, clicks, impressions, CTR, SOV,
-  SOH, cross-platform price comparison → `UNSUPPORTED`.
-- The prompt states the real coverage so the router does not pretend the bot
-  supports all platforms.
+- **NUMERIC** covers both layers. Anything that sounds like a KPI is numeric:
+  sales, revenue, GMV, units, ASP, growth, OSA, listing, SOV, SOH, price parity,
+  ROAS, ad spend, CTR, clicks, impressions, conversion, fill rate,
+  serviceability, invoice/pending value.
+- **UNSUPPORTED** is reserved for genuinely absent data:
+  - delivery ETA (the column exists but is NULL in every row);
+  - any Instamart or JioMart question (no rows);
+  - industry market share / total category size (no category-size input).
+- The prompt explicitly lists the Gold KPIs that must **not** be sent to
+  `UNSUPPORTED`, and states the real Silver coverage so the router does not
+  pretend every SKU × store reading exists.
+- `src/graph/router.py` also has a fast keyword override. It now only
+  short-circuits Instamart, JioMart, delivery ETA and industry market share;
+  the old override that sent sales/SOV/SOH/ROAS/clicks/impressions to
+  `UNSUPPORTED` was removed. The override also skips the "tell me about…"
+  clarification when the question names a metric.
 
 If the router LLM call throws, the state becomes `AMBIGUOUS` and `router_error`
 is set. That is a deliberate fail-safe: ask a clarifying question rather than
@@ -161,12 +215,28 @@ plan_query → validate_sql → execute_sql → verify_numeric → format_answer
                      sql_abstain / zero_rows
 ```
 
-**plan_query** — loads `metrics/metric_dictionary.yaml`, keyword-matches a
-metric if possible, and asks the LLM (prompt: `src/prompts/sql_planner.md`) for
-a single `SELECT` in JSON: `{"sql": "..."}` or `{"error": "..."}`.
-The planner prompt contains the exact literal values (lowercase platforms, the
-11 city spellings, brand examples) and the rule: *only add filters the question
-asks for*.
+**plan_query** — loads `metrics/metric_dictionary.yaml`, matches a metric by
+name **or alias** (longest phrase wins, word-boundary aware), and asks the LLM
+(prompt: `src/prompts/sql_planner.md`) for a single `SELECT` in JSON:
+`{"sql": "..."}` or `{"error": "..."}`.
+
+The planner prompt contains:
+
+- the exact Silver literal values (lowercase platforms, the 11 city spellings,
+  brand examples) and the rule: *only add filters the question asks for*;
+- the full Gold relation map (tables, views, columns) and the Gold conventions
+  (`obs_date`, `city_slug` vs `dim_city`, `SUM(num)/SUM(den)`, `store_key IS
+  NULL`, lowercase platform, SOV ≠ SOH, `fp_*` vs scraped);
+- the **full SQL template for the metric(s) the question names**, plus a compact
+  index of every other metric;
+- `dash.metric_catalog` rendered at plan time (cached for 15 minutes), so all
+  57 Gold metrics are known without hardcoding them. Non-`computed` statuses
+  (`proxy`, `partial`, `blocked`) keep their formula and missing-input note.
+
+The catalog is capped at 4.5 kB and only named metrics get a full template. That
+keeps the prompt under ~6 k tokens; Groq's free tier caps `openai/gpt-oss-120b`
+at 8 k tokens per minute, and an untrimmed 33-template prompt was rejected with
+HTTP 413.
 
 **validate_sql** — `src/db/safe_sql.py` is the firewall. It:
 
@@ -175,8 +245,11 @@ asks for*.
    `pg_sleep`, `pg_read_file`, `pg_ls_dir`, `lo_export`, `lo_import`, `dblink`);
 2. rejects multiple statements (no `;` chaining);
 3. parses the SQL with `sqlglot` and requires `SELECT`/`UNION`;
-4. requires **every** referenced relation to be one of the three allowlisted
-   views (`silver.demo` and base tables are permanently excluded);
+4. requires **every** referenced relation to be in the curated allowlist —
+   the three Silver views plus a hand-picked set of `dash.*` tables, dimensions
+   and views (`SILVER_RELATIONS | GOLD_TABLES | GOLD_DIMENSIONS | GOLD_VIEWS`).
+   `silver.demo`, the base scraped tables, and the `app`/`ops`/`auth`/`storage`
+   schemas are permanently excluded;
 5. appends `LIMIT 200` if no limit is present.
 
 **execute_sql** — `src/db/client.py` runs the query through a connection pool
@@ -241,14 +314,18 @@ remove them.
 
 ### What is indexed
 
-Chroma (persistent, `./chroma_db`, collection `sidnl_docs`) holds **3,848
+Chroma (persistent, `./chroma_db`, collection `sidnl_docs`) holds **3,910
 documents**:
 
 | Kind | Count | Built from |
 |---|---|---|
-| `data_rows` | ~3,813 | chunks of 25 rows from the three silver views |
-| `metric` | one per metric | `metrics/metric_dictionary.yaml` |
-| `documentation` | one per markdown heading | `metrics/*.md` and `docs/**/*.md` |
+| `data_rows` | 3,813 | chunks of 25 rows from the three Silver views |
+| `metric` | 37 | one per metric in `metrics/metric_dictionary.yaml` |
+| `documentation` | 60 | one per markdown heading in `metrics/*.md` and `docs/**/*.md` |
+
+`metrics/gold_layer.md` is the newest documentation source: it explains the Gold
+(`dash`) layer, OSA, SOH vs SOV, roll-up rules, first-party tables, serviceability
+and freshness, and is what the DEFINITION path cites for Gold questions.
 
 Embeddings: `intfloat/multilingual-e5-base`, computed locally (CPU). No API key
 needed for embeddings.
@@ -284,9 +361,9 @@ DEFINITION path stays on documentation.
 
 | Guardrail | Where | What it prevents |
 |---|---|---|
-| Route classification | `src/graph/router.py` | answering sales/ROAS/ETA questions with guesses |
+| Route classification | `src/graph/router.py` | refusing a supported Gold KPI, or answering genuinely absent data (ETA/Instamart/JioMart/industry share) with a guess |
 | SQL keyword blocklist | `src/db/safe_sql.py` | writes, DDL, file/system functions |
-| Relation allowlist | `src/db/safe_sql.py` | reading `silver.demo` or base tables |
+| Relation allowlist | `src/db/safe_sql.py` | reading `silver.demo`, base scraped tables, or non-curated `dash.*` relations |
 | Single-statement rule | `src/db/safe_sql.py` | SQL injection via `;` |
 | Auto `LIMIT 200` | `src/db/safe_sql.py` | accidental full-table dumps |
 | Read-only transactions | `src/db/client.py` | any write at the database level |
@@ -294,6 +371,7 @@ DEFINITION path stays on documentation.
 | One repair attempt | `src/graph/sql_graph.py` | infinite retry loops |
 | Numeric grounding check | `src/graph/sql_graph.py` | numbers not present in the rows |
 | Zero-row abstention | `src/graph/sql_graph.py` | silently changing filters to force an answer |
+| Gold catalog injection | `src/graph/sql_graph.py` | planner inventing a Gold formula or mislabelling a `proxy`/`partial` metric |
 | Claim verification | `src/graph/rag_graph.py` | unsupported statements in definitions |
 | Citation requirement | `src/graph/rag_graph.py` | answers with no traceable source |
 | `router_error` field | `src/graph/router.py` + API | hiding provider outages as routing errors |
@@ -350,6 +428,16 @@ The first baseline exposed a real bug: generated SQL used
 returned zero rows. The planner prompt now lists exact literals and product
 matching rules. A six-question spot check after the fix passes (N26, N01, N34,
 N07, N33, D03). A full re-run on the production model is still pending.
+
+> **⚠️ The Gold rollout makes part of this baseline stale.** The eval set was
+> written when only Silver was readable, so a number of its `UNSUPPORTED`
+> questions (sales, revenue, SOV, SOH, ROAS, clicks, impressions) are now
+> **answerable from the Gold layer**. Their `expect_abstain: true` flags and
+> ground-truth SQL were left **unchanged on purpose** — the eval is the
+> contract, and silently rewriting it to match new behaviour would hide the
+> change. Treat those rows as known-stale expectations, not regressions. They
+> should be re-labelled (route `NUMERIC`, real `ground_truth_sql`) once the Gold
+> grants are in place and the numbers can be validated, then re-baselined.
 
 > **Do not quote stability numbers from a run where the provider was rate
 > limited.** A `429` makes the router fail safe to `AMBIGUOUS`, which looks like
@@ -408,10 +496,43 @@ copy .env.example .env
 Current deployment uses Groq with `openai/gpt-oss-120b` for all three LLM roles
 (the OpenAI account has no credits). Any OpenAI-compatible provider works.
 
+### Database access (one-time, run as the `postgres` owner)
+
+The chatbot connects with a **read-only** role (`sidnl_chatbot_app`). That role
+needs `USAGE` + `SELECT` on **both** `silver` and `dash`. Without the Gold grant
+every KPI query fails with `permission denied for schema dash`.
+
+```powershell
+# as the postgres owner, against the same database as DATABASE_URL
+psql "$SUPABASE_DB_URL" -f sql\04_gold_access.sql
+```
+
+`sql/04_gold_access.sql` is safe to re-run. It:
+
+1. grants `USAGE` on `silver` and `dash`;
+2. grants `SELECT ON ALL TABLES IN SCHEMA` for both schemas;
+3. sets `ALTER DEFAULT PRIVILEGES FOR ROLE postgres` so future Gold tables are
+   readable without another manual grant;
+4. creates the safety view `dash.v_chatbot_availability_city` (city totals only);
+5. re-asserts read-only defaults and the 10 s statement timeout;
+6. ends with verification queries.
+
+`sql/03_roles.sql` is the fuller, canonical version of the same grants (plus
+revokes on `public`/`app`/`ops`/`auth`/`storage`). The database grant is
+deliberately broad; the real guardrail is the curated allowlist in
+`src/db/safe_sql.py`.
+
+Verify after running it:
+
+```sql
+select count(*) from dash.metric_catalog;               -- expect 57
+select count(*) from dash.v_chatbot_availability_city;  -- city-total rows only
+```
+
 ### Verify the install
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q          # 81 tests
+.\.venv\Scripts\python.exe -m pytest -q          # 83 tests
 .\.venv\Scripts\python.exe -m compileall -q src eval scripts tests
 ```
 
@@ -460,13 +581,13 @@ Rag/
 │   ├── api/app.py             FastAPI /health and /chat
 │   ├── graph/
 │   │   ├── main_graph.py      top-level router → subgraph wiring
-│   │   ├── router.py          LLM question classification
-│   │   ├── sql_graph.py       NUMERIC path
+│   │   ├── router.py          LLM question classification (+ keyword override)
+│   │   ├── sql_graph.py       NUMERIC path (Silver + Gold, catalog loader)
 │   │   ├── rag_graph.py       DEFINITION path
 │   │   ├── prompt_utils.py    safe template rendering (handles literal JSON)
 │   │   └── state.py           shared ChatState schema
 │   ├── db/
-│   │   ├── safe_sql.py        SQL firewall / allowlist / LIMIT injection
+│   │   ├── safe_sql.py        SQL firewall / Silver+Gold allowlist / LIMIT injection
 │   │   └── client.py          read-only pool, 10 s timeout, bulk connection
 │   ├── retrieval/
 │   │   ├── hybrid.py          Chroma + BM25 + RRF
@@ -474,10 +595,14 @@ Rag/
 │   └── prompts/               all LLM prompts as markdown
 ├── scripts/                   index builders, profiler, ground truth
 ├── eval/                      questions.jsonl, run_eval.py, rescore.py
-├── metrics/                   metric_dictionary.yaml, status_vocabulary.md
+├── metrics/                   metric_dictionary.yaml, status_vocabulary.md,
+│                              gold_layer.md (Gold definitions for DEFINITION Qs)
 ├── reports/                   committed markdown evidence (bulk output ignored)
-├── tests/                     81 tests
-└── sql/                       reference SQL (views, roles, diagnostics)
+├── tests/                     83 tests
+└── sql/                       reference SQL
+    ├── 01_views.sql           Silver views + Gold map + availability_city view
+    ├── 03_roles.sql           canonical Silver+Gold grants, revokes, timeouts
+    └── 04_gold_access.sql     safe, re-runnable script for the owner to unblock Gold
 ```
 
 ---
@@ -495,7 +620,7 @@ Check the generated SQL (`sql` field) for:
 The write usually succeeded. Verify before rebuilding:
 
 ```python
-col.count()            # should be 3,848
+col.count()            # should be 3,910
 col.get(limit=3)       # returns ids + metadata + documents
 col.query(...)         # returns hits
 ```
@@ -512,9 +637,26 @@ quota is exhausted; the router fails safe. Wait for the quota to reset, or
 switch models in `.env`.
 
 **Numbers are wrong but the SQL looks right.**
-Check `metric_status`. `draft` metrics are usable but flagged with a banner;
-their definitions may still change. `unsupported` metrics must not be answered
-with SQL.
+Check `metric_status`:
+- `gold` — computed by the Gold (`dash`) layer; `dash.metric_catalog` holds the
+  authoritative formula. If the catalog status is `proxy` / `partial` /
+  `blocked`, the number is not the final KPI and `missing_inputs` says why.
+- `draft` — usable but flagged with a banner; the definition may still change.
+- `unsupported` — must not be answered with SQL.
+
+**Every Gold query fails with `permission denied for schema dash`.**
+The read-only role has no `USAGE` on `dash` yet. Run
+`sql/04_gold_access.sql` as the `postgres` owner (see §11), then confirm
+`select count(*) from dash.metric_catalog;` returns 57. Until then the planner
+still works (it falls back to the Gold relation map) but execution cannot read
+Gold.
+
+**A numeric question fails with HTTP 413 / "Request too large".**
+The planner prompt exceeded the provider's per-minute token cap. On Groq's free
+tier `openai/gpt-oss-120b` is limited to 8 k TPM. The prompt is now trimmed: only
+the metric(s) the question names get a full SQL template, and the Gold catalog is
+capped at 4.5 kB. If it recurs, lower `_GOLD_CATALOG_CHAR_BUDGET` or the
+`template_chars` / `max_full` arguments in `_build_metric_templates_text`.
 
 **Server will not start / port in use.**
 
@@ -538,10 +680,20 @@ have ever appeared in chat logs or terminal output. Keep `.env` out of git
 - The critic and generator share a model family, so self-verification is a
   quality check, not proof.
 - `delivery_eta_minutes` is 100 % NULL and is never used.
-- `N16`, `N25`, `N30` in the eval set are answerable but currently route to
-  `UNSUPPORTED` — a known router gap.
+- **Gold reads are pending a one-time grant.** `sql/04_gold_access.sql` must be
+  run by the database owner; until then every `dash.*` query returns
+  `permission denied for schema dash`.
+- **The eval expectations for sales / revenue / SOV / SOH / ROAS / clicks /
+  impressions are stale.** They were written for a Silver-only bot and are still
+  marked `expect_abstain`. They were deliberately not rewritten; re-label and
+  re-baseline after the Gold grant lands.
+- `N16`, `N25`, `N30` in the eval set are answerable but route to `UNSUPPORTED`
+  under the old routing; the router override that caused this has been removed,
+  so a re-run should fix them.
 - The full 75-question eval has not yet been re-run on the production model
-  after the planner fix.
+  after the planner and Gold changes (Groq daily-token quota).
+- Genuinely unavailable, and correctly refused: delivery ETA, Instamart,
+  JioMart, industry market share / total category size.
 
 ---
 
@@ -552,6 +704,16 @@ See `OPEN_QUESTIONS.md` for the authoritative list. The main ones:
 - Should NULL `availability` be a separate bucket ("unknown") or excluded?
 - Confirm `observed_in_stock_rate` and `avg_discount_pct` definitions with the
   analytics mentor before marking them `approved`.
-- Share of Voice / Share of Shelf definitions are still pending.
+- **Share of Shelf (SOH) vs Share of Voice (SOV):** both now have a Gold
+  definition (`metrics/gold_layer.md`) and a formula in `dash.metric_catalog`.
+  What still needs sign-off is whether those are the *company* definitions, and
+  whether brand-level SOV should include keyword campaigns or category shelf
+  only.
+- **Gold `proxy` / `partial` metrics:** several `dash.metric_catalog` rows are
+  proxies or have missing inputs. Each needs an owner decision on whether to
+  publish them as-is or wait for the missing feed.
+- **Eval re-baseline:** which of the old `UNSUPPORTED` expectations should
+  become `NUMERIC` Gold questions, and what ground-truth SQL each should use.
 - Cross-platform product matching is not built, so cross-platform price
-  comparison is unsupported.
+  comparison across *different* SKUs is unsupported. (Gold
+  `v_comp_cross_marketplace` compares the same SIDNL id on two platforms.)

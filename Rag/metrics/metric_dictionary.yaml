@@ -1,7 +1,36 @@
+# =============================================================================
+# SIDNL metric dictionary
+# =============================================================================
+# Two layers:
+#   silver : raw, quality-filtered SKU x store readings (price, stock, shelf).
+#            Use for "what is the price of X at store Y right now".
+#   gold   : pre-aggregated dashboard tables/views in the dash schema
+#            (OSA, SOV/SOH, pricing parity, competitor layer, first-party
+#            sales/ads/finance). Use for anything that sounds like a KPI.
+#
+# status:
+#   approved    - formula agreed, safe to answer
+#   draft       - usable but the definition may still change (answer carries a
+#                 "draft metric" banner)
+#   gold        - computed by the Gold pipeline; authoritative formula lives in
+#                 dash.metric_catalog (57 metrics). Treated like approved.
+#   unsupported - genuinely not in the data
+#
+# The full authoritative Gold list is read from dash.metric_catalog at plan
+# time and appended to the SQL planner prompt. The entries below are the ones
+# we can give exact, tested SQL templates for.
+# =============================================================================
+
 metrics:
 
+  # ===========================================================================
+  # SILVER LAYER
+  # ===========================================================================
+
   - name: observed_in_stock_rate
+    layer: silver
     status: draft
+    aliases: [in stock rate, instock rate, availability rate, oos rate]
     definition: >
       count(availability = true) / count(availability IS NOT NULL)
       on silver.v_latest_observation.
@@ -13,8 +42,6 @@ metrics:
       SELECT
         platform,
         city,
-        {brand_filter}
-        {category_filter}
         COUNT(*) FILTER (WHERE availability = true)                   AS in_stock_count,
         COUNT(*) FILTER (WHERE availability IS NOT NULL)              AS denominator,
         ROUND(
@@ -26,9 +53,9 @@ metrics:
       FROM silver.v_latest_observation
       WHERE 1=1
         {where_clauses}
-      GROUP BY platform, city {group_by_extra}
+      GROUP BY platform, city
       ORDER BY platform, city
-    grain: platform × city × (optional brand/category)
+    grain: platform x city x (optional brand/category)
     required_filters:
       - platform (optional; omit for all platforms)
       - city or store_id (optional)
@@ -37,9 +64,11 @@ metrics:
       - Confirm denominator definition with analytics mentor before marking approved.
 
   - name: observed_oos_rate
+    layer: silver
     status: draft
+    aliases: [out of stock rate, oos]
     definition: >
-      1 − observed_in_stock_rate. Same denominator (excludes NULL availability).
+      1 - observed_in_stock_rate. Same denominator (excludes NULL availability).
     source_view: silver.v_latest_observation
     sql_template: |
       SELECT
@@ -54,24 +83,26 @@ metrics:
       FROM silver.v_latest_observation
       WHERE 1=1
         {where_clauses}
-      GROUP BY platform, city {group_by_extra}
+      GROUP BY platform, city
       ORDER BY platform, city
-    grain: platform × city × (optional brand/category)
+    grain: platform x city x (optional brand/category)
     required_filters: []
     open_questions:
       - Inherits the NULL-availability open question from observed_in_stock_rate.
 
   - name: avg_discount_pct
+    layer: silver
     status: draft
+    aliases: [discount, discount percentage, discount percent]
     definition: >
-      avg(discount_percentage) where mrp > 0, using simple average.
-      OPEN QUESTION: Should this be weighted (e.g. by listing count or inventory)?
+      avg(discount_percentage) where mrp > 0, using simple average, from the
+      raw silver observations. For the Gold dashboard discount use
+      gold_discount_pct instead.
     source_view: silver.v_latest_observation
     sql_template: |
       SELECT
         platform,
         city,
-        {brand_filter}
         ROUND(AVG(discount_percentage), 2) AS avg_discount_pct,
         COUNT(*) AS listing_count,
         MIN(observed_at) AS observed_at_min,
@@ -80,52 +111,48 @@ metrics:
       WHERE mrp > 0
         AND discount_percentage IS NOT NULL
         {where_clauses}
-      GROUP BY platform, city {group_by_extra}
+      GROUP BY platform, city
       ORDER BY platform, city
-    grain: platform × city × (optional brand/category)
+    grain: platform x city x (optional brand/category)
     required_filters: []
     open_questions:
-      - Weighted vs simple average — confirm with analytics mentor.
+      - Weighted vs simple average - confirm with analytics mentor.
 
   - name: current_price
+    layer: silver
     status: draft
+    aliases: [price, selling price, mrp, sp]
     definition: >
-      Latest sale_price and mrp per listing and store from silver.v_latest_observation.
+      Latest sale_price and mrp per listing and store from
+      silver.v_latest_observation.
     source_view: silver.v_latest_observation
     sql_template: |
       SELECT
-        platform,
-        product_name,
-        sku_name,
-        brand,
-        city,
-        store_name,
-        mrp,
-        sale_price,
-        discount_percentage,
-        currency,
-        observed_at
+        platform, product_name, sku_name, brand, city, store_name,
+        mrp, sale_price, discount_percentage, currency, observed_at
       FROM silver.v_latest_observation
       WHERE 1=1
         {where_clauses}
       ORDER BY platform, city, product_name
-    grain: platform × listing × store
+    grain: platform x listing x store
     required_filters:
       - product_name or brand (at least one recommended to limit result set)
     open_questions: []
 
   - name: ad_placement_rate
+    layer: silver
     status: draft
+    aliases: [ad rate, sponsored share, ad share]
     definition: >
-      count(*) FILTER (WHERE is_ad = true) / count(*) on silver.v_latest_shelf_position.
+      count(*) FILTER (WHERE is_ad = true) / count(*) on
+      silver.v_latest_shelf_position.
     source_view: silver.v_latest_shelf_position
     sql_template: |
       SELECT
         platform,
         city,
-        {category_filter}
         COUNT(*) FILTER (WHERE is_ad = true)              AS ad_count,
-        COUNT(*)                                           AS total_count,
+        COUNT(*)                                          AS total_count,
         ROUND(
           COUNT(*) FILTER (WHERE is_ad = true)::numeric /
           NULLIF(COUNT(*), 0) * 100,
@@ -135,25 +162,24 @@ metrics:
       FROM silver.v_latest_shelf_position
       WHERE 1=1
         {where_clauses}
-      GROUP BY platform, city {group_by_extra}
+      GROUP BY platform, city
       ORDER BY platform, city
-    grain: platform × city × (optional category)
+    grain: platform x city x (optional category)
     required_filters: []
     open_questions:
       - Confirm whether is_ad in observation rows should also count (currently only shelf_position).
 
   - name: avg_organic_position
+    layer: silver
     status: draft
+    aliases: [organic position, position, rank]
     definition: >
-      avg(organic_position) per brand and category from silver.v_latest_shelf_position.
-      NULL organic_position rows are excluded.
+      avg(organic_position) per brand and category from
+      silver.v_latest_shelf_position. NULL organic_position rows are excluded.
     source_view: silver.v_latest_shelf_position
     sql_template: |
       SELECT
-        platform,
-        city,
-        brand,
-        l1_category,
+        platform, city, brand, l1_category,
         ROUND(AVG(organic_position), 2) AS avg_organic_position,
         COUNT(*) AS listing_count,
         MIN(observed_at) AS observed_at_min,
@@ -161,105 +187,814 @@ metrics:
       FROM silver.v_latest_shelf_position
       WHERE organic_position IS NOT NULL
         {where_clauses}
-      GROUP BY platform, city, brand, l1_category {group_by_extra}
+      GROUP BY platform, city, brand, l1_category
       ORDER BY platform, city, avg_organic_position
-    grain: platform × city × brand × l1_category
+    grain: platform x city x brand x l1_category
+    required_filters: []
+    open_questions: []
+
+  # ===========================================================================
+  # GOLD LAYER - availability / OSA
+  # ===========================================================================
+
+  - name: osa_pct
+    layer: gold
+    status: gold
+    aliases: [osa, on shelf availability, availability, in stock rate, instock]
+    definition: >
+      On-shelf availability: osa_available_obs / osa_eligible_obs from the
+      Gold availability table (city-level rows only). Roll up as SUM(num)/SUM(den),
+      never as an average of daily percentages. Use
+      dash.v_chatbot_availability_city so per-store rows are excluded.
+    source_view: dash.v_chatbot_availability_city
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        SUM(osa_available_obs) AS osa_available_obs,
+        SUM(osa_eligible_obs)  AS osa_eligible_obs,
+        ROUND(100.0 * SUM(osa_available_obs) /
+              NULLIF(SUM(osa_eligible_obs), 0), 2) AS osa_pct,
+        MIN(obs_date) AS obs_date_min,
+        MAX(obs_date) AS obs_date_max
+      FROM dash.v_chatbot_availability_city
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY platform, city_slug
+      ORDER BY platform, city_slug
+    grain: platform x city x day (one row per SKU)
+    required_filters: []
+    open_questions: []
+
+  - name: listing_pct
+    layer: gold
+    status: gold
+    aliases: [listing, distribution, weighted distribution, availability of listing]
+    definition: >
+      Share of eligible dark stores where the SKU is listed:
+      SUM(ds_listed_stores) / SUM(ds_eligible_stores) from
+      dash.v_chatbot_availability_city.
+    source_view: dash.v_chatbot_availability_city
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        SUM(ds_listed_stores)   AS ds_listed_stores,
+        SUM(ds_eligible_stores) AS ds_eligible_stores,
+        ROUND(100.0 * SUM(ds_listed_stores) /
+              NULLIF(SUM(ds_eligible_stores), 0), 2) AS listing_pct,
+        MIN(obs_date) AS obs_date_min,
+        MAX(obs_date) AS obs_date_max
+      FROM dash.v_chatbot_availability_city
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY platform, city_slug
+      ORDER BY platform, city_slug
+    grain: platform x city x day (one row per SKU)
+    required_filters: []
+    open_questions: []
+
+  - name: out_of_stock_stores
+    layer: gold
+    status: gold
+    aliases: [stockouts, oos stores, out of stock]
+    definition: >
+      Number of store-SKU combinations out of stock on the latest day:
+      SUM(out_of_stock_stores) from dash.v_chatbot_availability_city.
+    source_view: dash.v_chatbot_availability_city
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        obs_date,
+        SUM(out_of_stock_stores) AS out_of_stock_stores,
+        SUM(in_stock_stores)     AS in_stock_stores,
+        SUM(low_stock_stores)    AS low_stock_stores
+      FROM dash.v_chatbot_availability_city
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY platform, city_slug, obs_date
+      ORDER BY obs_date DESC, platform, city_slug
+    grain: platform x city x day
+    required_filters: []
+    open_questions: []
+
+  - name: doi_fe
+    layer: gold
+    status: gold
+    aliases: [days of inventory, doi, stock cover]
+    definition: >
+      Days of inventory (front-end): drr-based cover in days from
+      dash.availability (doi_fe). Higher = more cover. Use city-level rows.
+    source_view: dash.v_chatbot_availability_city
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        obs_date,
+        ROUND(AVG(doi_fe), 1)  AS avg_doi_fe,
+        ROUND(AVG(doi_be), 1)  AS avg_doi_be,
+        SUM(drr)               AS drr
+      FROM dash.v_chatbot_availability_city
+      WHERE doi_fe IS NOT NULL
+        {where_clauses}
+      GROUP BY platform, city_slug, obs_date
+      ORDER BY obs_date DESC, platform, city_slug
+    grain: platform x city x day
+    required_filters: []
+    open_questions:
+      - Is DOI reported per SKU or weighted by inventory? Confirm aggregation.
+
+  - name: potential_sales_loss
+    layer: gold
+    status: draft
+    aliases: [sales loss, lost sales, gmv at risk]
+    definition: >
+      Modelled revenue at risk from stockouts, from
+      dash.availability.potential_sales_loss. This is a modelled estimate, not
+      an observed value - always label it as such.
+    source_view: dash.v_chatbot_availability_city
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        obs_date,
+        ROUND(SUM(potential_sales_loss), 2) AS potential_sales_loss
+      FROM dash.v_chatbot_availability_city
+      WHERE potential_sales_loss IS NOT NULL
+        {where_clauses}
+      GROUP BY platform, city_slug, obs_date
+      ORDER BY obs_date DESC, potential_sales_loss DESC
+    grain: platform x city x day
+    required_filters: []
+    open_questions:
+      - Confirm the loss model with the analytics mentor before quoting as fact.
+
+  # ===========================================================================
+  # GOLD LAYER - pricing / parity
+  # ===========================================================================
+
+  - name: gold_discount_pct
+    layer: gold
+    status: gold
+    aliases: [discount, discount percentage, discount percent]
+    definition: >
+      Discount percentage from the Gold pricing table (observed per SKU x city
+      x day). Use weighted_discount_pct when rolling up across SKUs; a plain
+      AVG(discount_pct) is a simple average.
+    source_view: dash.pricing
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        obs_date,
+        ROUND(AVG(discount_pct), 2)          AS avg_discount_pct,
+        ROUND(AVG(weighted_discount_pct), 2) AS avg_weighted_discount_pct,
+        COUNT(*)                             AS sku_rows
+      FROM dash.pricing
+      WHERE discount_pct IS NOT NULL
+        {where_clauses}
+      GROUP BY platform, city_slug, obs_date
+      ORDER BY obs_date DESC, platform, city_slug
+    grain: platform x city x day (one row per SKU)
+    required_filters: []
+    open_questions: []
+
+  - name: price_parity_gap
+    layer: gold
+    status: gold
+    aliases: [price parity, parity break, price gap, price index]
+    definition: >
+      Price parity vs national / lowest marketplace / reference platform from
+      dash.pricing. is_parity_break flags rows outside the configured threshold.
+      price_gap_vs_lowest_marketplace_pct > 0 means we are dearer than the
+      cheapest marketplace.
+    source_view: dash.pricing
+    sql_template: |
+      SELECT
+        platform,
+        city_slug,
+        obs_date,
+        COUNT(*) FILTER (WHERE is_parity_break)                    AS parity_breaks,
+        COUNT(*) FILTER (WHERE is_parity_break IS NOT NULL)        AS parity_checked,
+        ROUND(AVG(price_gap_vs_lowest_marketplace_pct), 2)         AS avg_gap_vs_lowest_pct,
+        ROUND(AVG(price_vs_national_pct), 2)                       AS avg_vs_national_pct
+      FROM dash.pricing
+      WHERE is_parity_break IS NOT NULL
+        {where_clauses}
+      GROUP BY platform, city_slug, obs_date
+      ORDER BY obs_date DESC, platform, city_slug
+    grain: platform x city x day (one row per SKU)
     required_filters: []
     open_questions: []
 
   - name: cross_platform_price_gap
-    status: unsupported
+    layer: gold
+    status: gold
+    aliases: [cross platform price, same product price across platforms]
     definition: >
-      Requires a product-matching layer to identify the same SKU across platforms.
-      Not yet built. Per-platform prices are available via current_price.
-    source_view: null
-    sql_template: null
-    grain: null
-    required_filters: []
-    open_questions:
-      - When will the product-matching layer be ready?
-
-  - name: SOV
-    status: unsupported
-    definition: >
-      Share of Voice. Company definition pending — not yet agreed.
-      The chatbot will respond "SOV definition is pending" until this is resolved.
-    source_view: null
-    sql_template: null
-    grain: null
-    required_filters: []
-    open_questions:
-      - Company definition needed. Owner: product/analytics lead.
-
-  - name: SOH
-    status: unsupported
-    definition: >
-      Share of Shelf. Company definition pending — not yet agreed.
-    source_view: null
-    sql_template: null
-    grain: null
-    required_filters: []
-    open_questions:
-      - Company definition needed. Owner: product/analytics lead.
-
-  - name: sales
-    status: unsupported
-    definition: Sales data is not available in the SIDNL silver layer.
-    source_view: null
-    sql_template: null
-    grain: null
+      Same SIDNL id listed on two platforms in one city:
+      gap % = (max SP - min SP) / min SP, from dash.v_comp_cross_marketplace.
+      This is the built product-matching layer at SIDNL-id level; it is not a
+      guarantee that the two listings are the same pack.
+    source_view: dash.v_comp_cross_marketplace
+    sql_template: |
+      SELECT
+        sidnl_id,
+        city_slug,
+        brand_name,
+        product_name,
+        min_sp,
+        max_sp,
+        price_gap,
+        price_gap_pct,
+        cheapest_platform,
+        dearest_platform
+      FROM dash.v_comp_cross_marketplace
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY price_gap_pct DESC
+    grain: sidnl_id x city
     required_filters: []
     open_questions: []
 
-  - name: revenue
-    status: unsupported
-    definition: Revenue data is not available in the SIDNL silver layer.
-    source_view: null
-    sql_template: null
-    grain: null
+  # ===========================================================================
+  # GOLD LAYER - visibility / SOV / SOH
+  # ===========================================================================
+
+  - name: share_of_shelf
+    layer: gold
+    status: gold
+    aliases: [soh, share of shelf, shelf share]
+    definition: >
+      Share of Shelf: the brand's share of shelf impressions in a category,
+      from dash.v_brand_scorecard_latest.share_of_shelf_pct
+      (shelf_impressions / market_shelf_impressions). Roll up as
+      SUM(num)/SUM(den). NULL = not measured (category shelves are Blinkit).
+    source_view: dash.v_brand_scorecard_latest
+    sql_template: |
+      SELECT
+        obs_date,
+        platform,
+        city_slug,
+        brand_name,
+        shelf_impressions,
+        market_shelf_impressions,
+        share_of_shelf_pct,
+        shelf_rank_among_brands,
+        best_shelf_rank
+      FROM dash.v_brand_scorecard_latest
+      WHERE share_of_shelf_pct IS NOT NULL
+        {where_clauses}
+      ORDER BY obs_date DESC, share_of_shelf_pct DESC
+    grain: obs_date x platform x city (ALL = all cities) x brand
     required_filters: []
     open_questions: []
+
+  - name: share_of_voice
+    layer: gold
+    status: gold
+    aliases: [sov, share of voice]
+    definition: >
+      Share of Voice: the SKU's share of impressions for a category shelf or
+      keyword, from dash.visibility.share_of_voice_pct. Brand SOV is the SUM of
+      its SKUs' impressions over the market total in the same market; use
+      dash.v_workspace_sov_keyword for campaign-level keyword SOV.
+    source_view: dash.visibility
+    sql_template: |
+      WITH brand_vis AS (
+        SELECT v.obs_date, v.platform, v.city_slug, v.search_type, v.search_term,
+               SUM(v.impressions) AS brand_impressions
+        FROM dash.visibility v
+        JOIN dash.dim_sidnl s ON s.sidnl_id = v.sidnl_id
+        WHERE 1=1
+          {where_clauses}
+        GROUP BY 1,2,3,4,5
+      ),
+      market_vis AS (
+        SELECT obs_date, platform, city_slug, search_type, search_term,
+               SUM(impressions) AS market_impressions
+        FROM dash.visibility
+        WHERE 1=1
+          {where_clauses}
+        GROUP BY 1,2,3,4,5
+      )
+      SELECT b.obs_date, b.platform, b.city_slug, b.search_type, b.search_term,
+             b.brand_impressions, m.market_impressions,
+             ROUND(100.0 * b.brand_impressions /
+                   NULLIF(m.market_impressions, 0), 3) AS sov_pct
+      FROM brand_vis b
+      JOIN market_vis m
+        USING (obs_date, platform, city_slug, search_type, search_term)
+      ORDER BY b.obs_date DESC, sov_pct DESC
+    grain: obs_date x platform x city x search_type x search_term x SKU
+    required_filters: []
+    open_questions:
+      - Brand-level SOV must aggregate SKU impressions, not average the pct column.
+
+  - name: shelf_rank
+    layer: gold
+    status: gold
+    aliases: [rank, search rank, best rank, average rank]
+    definition: >
+      Search/shelf rank from dash.visibility: best_search_rank (lower is
+      better), avg_search_rank, avg_organic_rank. Rows with NULL rank were not
+      found on the shelf.
+    source_view: dash.visibility
+    sql_template: |
+      SELECT
+        obs_date,
+        platform,
+        city_slug,
+        search_type,
+        search_term,
+        MIN(best_search_rank)  AS best_rank,
+        ROUND(AVG(avg_search_rank), 2)   AS avg_rank,
+        ROUND(AVG(avg_organic_rank), 2)  AS avg_organic_rank,
+        SUM(impressions) AS impressions
+      FROM dash.visibility
+      WHERE best_search_rank IS NOT NULL
+        {where_clauses}
+      GROUP BY obs_date, platform, city_slug, search_type, search_term
+      ORDER BY obs_date DESC, best_rank
+    grain: obs_date x platform x city x search_type x search_term x SKU
+    required_filters: []
+    open_questions: []
+
+  # ===========================================================================
+  # GOLD LAYER - first-party sales
+  # ===========================================================================
+
+  - name: gmv
+    layer: gold
+    status: gold
+    aliases: [sales, revenue, turnover, sales value, gross merchandise value]
+    definition: >
+      First-party GMV from dash.v_fp_sales_day (sum of dash.fp_sales_daily.gmv
+      per brand x sales_date). This is Blinkit first-party sales data, not
+      scraped marketplace sales.
+    source_view: dash.v_fp_sales_day
+    sql_template: |
+      SELECT
+        sales_date,
+        ROUND(SUM(gmv), 2) AS gmv,
+        SUM(units)         AS units,
+        ROUND(SUM(gmv) / NULLIF(SUM(units), 0), 2) AS asp
+      FROM dash.v_fp_sales_day
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY sales_date
+      ORDER BY sales_date DESC
+    grain: brand x sales_date
+    required_filters: []
+    open_questions: []
+
+  - name: units_sold
+    layer: gold
+    status: gold
+    aliases: [units, quantity sold, volume]
+    definition: >
+      First-party units sold from dash.v_fp_sales_day.units
+      (sum of dash.fp_sales_daily.quantity).
+    source_view: dash.v_fp_sales_day
+    sql_template: |
+      SELECT
+        sales_date,
+        SUM(units) AS units,
+        ROUND(SUM(gmv), 2) AS gmv
+      FROM dash.v_fp_sales_day
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY sales_date
+      ORDER BY sales_date DESC
+    grain: brand x sales_date
+    required_filters: []
+    open_questions: []
+
+  - name: asp
+    layer: gold
+    status: gold
+    aliases: [average selling price, average price realised]
+    definition: >
+      Average selling price = GMV / units, from dash.v_fp_sales_day.asp.
+    source_view: dash.v_fp_sales_day
+    sql_template: |
+      SELECT
+        sales_date,
+        ROUND(SUM(gmv) / NULLIF(SUM(units), 0), 2) AS asp,
+        SUM(units) AS units,
+        ROUND(SUM(gmv), 2) AS gmv
+      FROM dash.v_fp_sales_day
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY sales_date
+      ORDER BY sales_date DESC
+    grain: brand x sales_date
+    required_filters: []
+    open_questions: []
+
+  - name: sales_growth_pct
+    layer: gold
+    status: gold
+    aliases: [growth, gmv growth, sales growth, momentum]
+    definition: >
+      Last-28-days GMV / units versus the prior 28 days, from
+      dash.v_fp_sales_health (gmv_growth_pct, units_growth_pct). "as_of" is the
+      latest sales date in the data.
+    source_view: dash.v_fp_sales_health
+    sql_template: |
+      SELECT
+        as_of,
+        gmv_28d,
+        gmv_prev_28d,
+        gmv_growth_pct,
+        units_28d,
+        units_growth_pct
+      FROM dash.v_fp_sales_health
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY as_of DESC
+    grain: brand (latest 28d vs prior 28d)
+    required_filters: []
+    open_questions: []
+
+  - name: sales_by_city
+    layer: gold
+    status: gold
+    aliases: [city sales, sales split by city, contribution by city]
+    definition: >
+      GMV/units and contribution by city from dash.v_fp_sales_city
+      (contribution_pct_total, contribution_pct_28d, growth_pct).
+    source_view: dash.v_fp_sales_city
+    sql_template: |
+      SELECT
+        city,
+        gmv_total,
+        units_total,
+        contribution_pct_total,
+        gmv_28d,
+        contribution_pct_28d,
+        growth_pct
+      FROM dash.v_fp_sales_city
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY gmv_total DESC
+    grain: brand x city
+    required_filters: []
+    open_questions: []
+
+  - name: top_skus_by_sales
+    layer: gold
+    status: gold
+    aliases: [best selling skus, top products, top skus]
+    definition: >
+      SKU-level sales from dash.v_fp_sales_sku (gmv_total, units_total,
+      gmv_28d, units_28d, avg_daily_units_28d, days_since_last_sale).
+    source_view: dash.v_fp_sales_sku
+    sql_template: |
+      SELECT
+        product_name,
+        gmv_total,
+        units_total,
+        asp,
+        gmv_28d,
+        units_28d,
+        avg_daily_units_28d,
+        days_since_last_sale
+      FROM dash.v_fp_sales_sku
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY gmv_total DESC
+    grain: brand x sku
+    required_filters: []
+    open_questions: []
+
+  # ===========================================================================
+  # GOLD LAYER - first-party ads
+  # ===========================================================================
 
   - name: ad_spend
-    status: unsupported
-    definition: Ad spend data is not available in the SIDNL silver layer.
-    source_view: null
-    sql_template: null
-    grain: null
-    required_filters: []
-    open_questions: []
-
-  - name: ROAS
-    status: unsupported
+    layer: gold
+    status: gold
+    aliases: [spend, advertising spend, ad wallet]
     definition: >
-      Return on Ad Spend. Neither ad spend nor sales are available in the data.
+      First-party ad spend. Two sources: dash.v_fp_ad_wallet_day.ad_spend
+      (wallet debits, the money actually spent) and dash.v_fp_ad_page.spend
+      (page-level reported spend). Prefer the wallet for "how much did we
+      spend", the page view for campaign performance.
+    source_view: dash.v_fp_ad_wallet_day
+    sql_template: |
+      SELECT
+        day,
+        ROUND(SUM(ad_spend), 2) AS ad_spend,
+        ROUND(SUM(topup), 2)    AS topup,
+        ROUND(SUM(refunds), 2)  AS refunds
+      FROM dash.v_fp_ad_wallet_day
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY day
+      ORDER BY day DESC
+    grain: brand x day
+    required_filters: []
+    open_questions: []
+
+  - name: ad_performance
+    layer: gold
+    status: gold
+    aliases: [roas, ctr, cpc, cpm, cvr, acos, clicks, impressions, conversion rate]
+    definition: >
+      Ad page performance from dash.v_fp_ad_page: impressions, clicks, atc,
+      orders, revenue, spend, and the derived ctr_pct, cpc, cpm, cvr_pct,
+      roas, acos_pct. One row per snapshot_label x page_name.
+    source_view: dash.v_fp_ad_page
+    sql_template: |
+      SELECT
+        snapshot_label,
+        page_name,
+        impressions,
+        clicks,
+        orders,
+        ROUND(revenue, 2) AS revenue,
+        ROUND(spend, 2)   AS spend,
+        ctr_pct,
+        cpc,
+        cpm,
+        cvr_pct,
+        roas,
+        acos_pct
+      FROM dash.v_fp_ad_page
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY spend DESC
+    grain: brand x snapshot_label x page_name
+    required_filters: []
+    open_questions: []
+
+  - name: roas
+    layer: gold
+    status: gold
+    aliases: [return on ad spend, robas]
+    definition: >
+      ROAS = revenue / spend, from dash.v_fp_ad_page.roas. Only defined where
+      both ad revenue and spend are present; NULL means not measurable.
+    source_view: dash.v_fp_ad_page
+    sql_template: |
+      SELECT
+        snapshot_label,
+        page_name,
+        ROUND(spend, 2)   AS spend,
+        ROUND(revenue, 2) AS revenue,
+        roas,
+        acos_pct
+      FROM dash.v_fp_ad_page
+      WHERE roas IS NOT NULL
+        {where_clauses}
+      ORDER BY roas DESC
+    grain: brand x snapshot_label x page_name
+    required_filters: []
+    open_questions: []
+
+  # ===========================================================================
+  # GOLD LAYER - supply chain / finance
+  # ===========================================================================
+
+  - name: fill_rate
+    layer: gold
+    status: gold
+    aliases: [fill rate, quantity fill rate, line fill rate, service level]
+    definition: >
+      Weekly fill rate from dash.fp_fill_rate: quantity_fill_rate and
+      line_fill_rate per brand x city x subcategory x week.
+    source_view: dash.fp_fill_rate
+    sql_template: |
+      SELECT
+        week_no,
+        date_from,
+        date_to,
+        city,
+        subcategory,
+        ROUND(AVG(quantity_fill_rate), 2) AS quantity_fill_rate,
+        ROUND(AVG(line_fill_rate), 2)     AS line_fill_rate
+      FROM dash.fp_fill_rate
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY week_no, date_from, date_to, city, subcategory
+      ORDER BY week_no DESC, city
+    grain: week x brand x city x subcategory
+    required_filters: []
+    open_questions: []
+
+  - name: serviceable_pct
+    layer: gold
+    status: gold
+    aliases: [serviceability, coverage, deliverable pincodes]
+    definition: >
+      Serviceability: points_serviceable / points_checked from dash.coverage,
+      per day x platform x city x source. Roll up as SUM/SUM. "Not serviceable"
+      is not the same as "out of stock".
+    source_view: dash.coverage
+    sql_template: |
+      SELECT
+        obs_date,
+        platform,
+        city_slug,
+        source_type,
+        SUM(points_serviceable) AS points_serviceable,
+        SUM(points_checked)     AS points_checked,
+        ROUND(100.0 * SUM(points_serviceable) /
+              NULLIF(SUM(points_checked), 0), 2) AS serviceable_pct,
+        SUM(stores_serving) AS stores_serving
+      FROM dash.coverage
+      WHERE 1=1
+        {where_clauses}
+      GROUP BY obs_date, platform, city_slug, source_type
+      ORDER BY obs_date DESC, platform, city_slug
+    grain: day x platform x city x source_type
+    required_filters: []
+    open_questions: []
+
+  - name: po_fill_rate
+    layer: gold
+    status: gold
+    aliases: [po fill rate, purchase order fill rate, shortfall]
+    definition: >
+      Purchase-order receipt performance from dash.v_fp_po_summary:
+      grn_qty / po_qty, po_value, grn_value, shortfall_qty, lead_days.
+    source_view: dash.v_fp_po_summary
+    sql_template: |
+      SELECT
+        po_code,
+        po_date,
+        po_status,
+        vendor,
+        store,
+        po_qty,
+        grn_qty,
+        fill_rate_pct,
+        po_value,
+        grn_value,
+        shortfall_qty,
+        lead_days
+      FROM dash.v_fp_po_summary
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY po_date DESC
+    grain: brand x PO
+    required_filters: []
+    open_questions: []
+
+  - name: invoice_pending_value
+    layer: gold
+    status: gold
+    aliases: [pending invoices, pending invoice, pending invoice value, pending value,
+              unpaid invoices, receivable, invoice reconciliation, invoice value]
+    definition: >
+      Finance summary from dash.v_fp_finance_summary: invoices, invoice_value,
+      pending_value, payments_received, debit_notes_value, ledger_opening /
+      ledger_closing, as_of.
+    source_view: dash.v_fp_finance_summary
+    sql_template: |
+      SELECT
+        as_of,
+        invoices,
+        invoice_value,
+        pending_value,
+        payments_received,
+        debit_notes_value,
+        mismatch_vs_grn_abs,
+        mismatch_vs_asn_abs,
+        ledger_opening,
+        ledger_closing
+      FROM dash.v_fp_finance_summary
+    grain: brand (single summary row)
+    required_filters: []
+    open_questions: []
+
+  - name: stock_on_hand
+    layer: gold
+    status: gold
+    aliases: [inventory, stock, stock on hand, soh stock]
+    definition: >
+      First-party stock on hand per SKU from dash.v_fp_sku_stock
+      (stock_on_hand, available_stores_pct, snapshot_at). Not the same as the
+      scraped inventory in silver; this is the brand's own warehouse/portal view.
+    source_view: dash.v_fp_sku_stock
+    sql_template: |
+      SELECT
+        product_name,
+        stock_on_hand,
+        available_stores_pct,
+        snapshot_at
+      FROM dash.v_fp_sku_stock
+      WHERE 1=1
+        {where_clauses}
+      ORDER BY stock_on_hand DESC
+    grain: brand x sku (latest snapshot)
+    required_filters: []
+    open_questions: []
+
+  - name: stock_cover_days
+    layer: gold
+    status: gold
+    aliases: [doi days, days of cover, stock cover days]
+    definition: >
+      SKU stock cover in days = stock_on_hand / (units_28d / 28), from
+      dash.v_fp_sales_sku.doi_days.
+    source_view: dash.v_fp_sales_sku
+    sql_template: |
+      SELECT
+        product_name,
+        stock_on_hand,
+        units_28d,
+        avg_daily_units_28d,
+        doi_days,
+        days_since_last_sale
+      FROM dash.v_fp_sales_sku
+      WHERE doi_days IS NOT NULL
+        {where_clauses}
+      ORDER BY doi_days ASC
+    grain: brand x sku
+    required_filters: []
+    open_questions: []
+
+  # ===========================================================================
+  # GOLD LAYER - data quality / freshness
+  # ===========================================================================
+
+  - name: data_freshness
+    layer: gold
+    status: gold
+    aliases: [freshness, stale, last updated, data as of]
+    definition: >
+      Whether Gold is fresh: dash.v_platform_freshness (per platform, no_data /
+      stale / fresh) and dash.v_refresh_status (per Gold table, age_minutes,
+      last_status, is_stale).
+    source_view: dash.v_platform_freshness
+    sql_template: |
+      SELECT
+        platform,
+        status,
+        last_data_at,
+        hours_since_last_data,
+        stale_sources,
+        fresh_sources
+      FROM dash.v_platform_freshness
+      ORDER BY platform
+    grain: platform
+    required_filters: []
+    open_questions: []
+
+  # ===========================================================================
+  # GENUINELY UNSUPPORTED
+  # ===========================================================================
+
+  - name: delivery_eta
+    layer: none
+    status: unsupported
+    aliases: [eta, delivery time, delivery minutes, instamart eta]
+    definition: >
+      Delivery ETA. The silver column delivery_eta_minutes exists but is NULL in
+      every row, and no Gold table computes it.
+    source_view: null
+    sql_template: null
+    grain: null
+    required_filters: []
+    open_questions:
+      - Will the scraper ever populate delivery_eta_minutes?
+
+  - name: instamart
+    layer: none
+    status: unsupported
+    aliases: [instamart, swiggy instamart]
+    definition: >
+      Instamart data. There are no Instamart rows in silver or Gold.
     source_view: null
     sql_template: null
     grain: null
     required_filters: []
     open_questions: []
 
-  - name: conversion
+  - name: jiomart
+    layer: none
     status: unsupported
-    definition: Conversion data (clicks, orders) is not available in the silver layer.
+    aliases: [jiomart, jio mart]
+    definition: >
+      JioMart data. There are no JioMart rows in silver or Gold.
     source_view: null
     sql_template: null
     grain: null
     required_filters: []
     open_questions: []
 
-  - name: clicks
+  - name: industry_market_share
+    layer: none
     status: unsupported
-    definition: Click data is not available in the SIDNL silver layer.
-    source_view: null
-    sql_template: null
-    grain: null
-    required_filters: []
-    open_questions: []
-
-  - name: impressions
-    status: unsupported
-    definition: Impression data is not available in the SIDNL silver layer.
+    aliases: [market share, total market size, category market share]
+    definition: >
+      Industry market share / total market size. SIDNL only sees the tracked
+      quick-commerce shelf; there is no category-size or competitor-revenue
+      input, so "share of the whole market" cannot be computed. Share of shelf
+      and share of voice ARE available from Gold.
     source_view: null
     sql_template: null
     grain: null

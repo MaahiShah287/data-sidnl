@@ -47,28 +47,188 @@ def _llm() -> ChatOpenAI:
     )
 
 
+# Statuses the planner may answer. 'gold' = computed by the Gold pipeline; the
+# authoritative formula is in dash.metric_catalog. It is treated like approved
+# (no draft banner), while 'unsupported' is the only blocking status.
+_ANSWERABLE_STATUSES = ("approved", "draft", "gold")
+
+
+def _norm_phrase(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def _matching_metrics(question: str, metrics: list[dict]) -> list[dict]:
+    """
+    All metrics whose name or an alias appears in the question, best first.
+
+    The longest matching phrase wins, so "share of shelf" beats a bare "shelf"
+    and "sales growth" beats "sales". Matching is word-boundary aware, so "osa"
+    does not fire inside "dosa" and "eta" does not fire inside "metadata".
+    """
+    q = _norm_phrase(question)
+    if not q:
+        return []
+
+    scored: list[tuple[int, int, dict]] = []
+    for order, m in enumerate(metrics):
+        terms = [m.get("name", "")]
+        terms.extend(m.get("aliases") or [])
+        score = 0
+        for term in terms:
+            phrase = _norm_phrase(term)
+            if not phrase:
+                continue
+            if re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", q):
+                score = max(score, len(phrase))
+        if score:
+            scored.append((score, -order, m))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [m for _, _, m in scored]
+
+
 def _match_metric(question: str, metrics: list[dict]) -> dict | None:
-    """Simple keyword match against metric names and definition text."""
-    q_lower = question.lower()
-    best = None
-    for m in metrics:
-        name_match = m["name"].lower().replace("_", " ") in q_lower
-        if name_match:
-            best = m
-            break
-    return best
+    matches = _matching_metrics(question, metrics)
+    return matches[0] if matches else None
 
 
-def _build_metric_templates_text(metrics: list[dict]) -> str:
-    approved_draft = [m for m in metrics if m["status"] in ("approved", "draft")]
-    lines = []
-    for m in approved_draft:
-        lines.append(f"-- Metric: {m['name']} [{m['status']}]")
-        lines.append(f"-- Definition: {m['definition'].strip()}")
+def _build_metric_templates_text(
+    metrics: list[dict],
+    question: str = "",
+    max_full: int = 2,
+    template_chars: int = 1000,
+) -> str:
+    """
+    Full SQL templates for the metric(s) the question actually names, plus a
+    compact index of the rest.
+
+    The planner prompt is capped by the LLM's per-minute token limit (Groq free
+    tier: 8k TPM), so dumping all 33 templates does not fit. The named metric
+    gets the exact template; everything else stays discoverable by name/status
+    and the Gold catalog below carries the formulas.
+    """
+    answerable = [m for m in metrics if m.get("status") in _ANSWERABLE_STATUSES]
+    if not answerable:
+        return "(none)"
+
+    matched = _matching_metrics(question, answerable)[:max_full]
+    matched_names = {m["name"] for m in matched}
+
+    lines: list[str] = []
+    for m in matched:
+        lines.append(
+            f"-- Metric: {m['name']} [{m.get('status')}] (layer: {m.get('layer', 'n/a')})"
+        )
+        lines.append(f"-- Definition: {' '.join(str(m.get('definition', '')).split())}")
         if m.get("sql_template"):
-            lines.append(m["sql_template"].strip()[:400])
+            template = str(m["sql_template"]).strip()
+            if len(template) > template_chars:
+                template = template[:template_chars] + "\n-- ... (template truncated)"
+            lines.append(template)
         lines.append("")
+
+    others = [m for m in answerable if m["name"] not in matched_names]
+    if others:
+        lines.append(
+            "-- Other available metrics (name [status/layer]). Use the relation "
+            "map above for their columns:"
+        )
+        for m in others:
+            lines.append(f"-- {m['name']} [{m.get('status')}/{m.get('layer', '?')}]")
+
     return "\n".join(lines) if lines else "(none)"
+
+
+# ---------------------------------------------------------------------------
+# Gold metric catalog (dash.metric_catalog)
+# ---------------------------------------------------------------------------
+# The catalog is the authoritative list of Gold metrics: formula, status
+# (computed | proxy | partial | blocked), source table/columns and what input
+# is missing. Injecting it into the planner prompt means every Gold metric is
+# known without hardcoding 57 entries in the prompt file.
+#
+# Read once, cache for 15 minutes: one chat turn makes a single catalog query,
+# while a Gold refresh (new metric) is picked up without an API restart.
+_GOLD_CATALOG_TTL_S = 900.0
+_GOLD_CATALOG_CHAR_BUDGET = 4500
+_gold_catalog_cache: tuple[float, str] | None = None
+
+
+def _catalog_line(r: dict) -> str:
+    key = r.get("metric_key") or r.get("metric_name") or "?"
+    status = r.get("status") or "unknown"
+    line = f"- {key} [{status}]"
+    # 'computed' needs no explanation; proxy/partial/blocked do, because the
+    # planner must not present them as authoritative.
+    if status != "computed":
+        formula = " ".join(str(r.get("formula") or "").split())
+        if formula:
+            line += f": {formula[:120]}"
+        missing = " ".join(str(r.get("missing_inputs") or "").split())
+        if missing:
+            line += f" (missing: {missing[:60]})"
+    return line
+
+
+def _render_catalog(rows: list[dict], budget: int) -> str:
+    """Render non-computed metrics first, then computed ones, within a budget."""
+    non_computed = [r for r in rows if (r.get("status") or "") != "computed"]
+    computed = [r for r in rows if (r.get("status") or "") == "computed"]
+
+    out: list[str] = []
+    used = 0
+    omitted = 0
+    for r in non_computed + computed:
+        line = _catalog_line(r)
+        if used + len(line) + 1 > budget:
+            omitted += 1
+            continue
+        out.append(line)
+        used += len(line) + 1
+
+    if omitted:
+        out.append(
+            f"- ... {omitted} more computed metrics omitted for prompt size; "
+            "query dash.metric_catalog for the full list."
+        )
+    return "\n".join(out)
+
+
+def _fetch_gold_catalog() -> str:
+    try:
+        from db.client import execute_safe
+
+        result = execute_safe(
+            "SELECT pdf_section, section_name, metric_key, metric_name, formula, "
+            "status, gold_table, gold_columns, missing_inputs, owner_team "
+            "FROM dash.metric_catalog "
+            "ORDER BY pdf_section NULLS LAST, metric_key"
+        )
+        rows = result.rows
+    except Exception as exc:
+        # Gold access may not be granted yet, or the DB is unreachable. The
+        # planner still has the relation map above, so degrade, never crash.
+        return (
+            "(Gold catalog unavailable: could not read dash.metric_catalog "
+            f"({type(exc).__name__}). Use the Gold relation map above.)"
+        )
+
+    if not rows:
+        return "(dash.metric_catalog is empty)"
+
+    return _render_catalog(rows, _GOLD_CATALOG_CHAR_BUDGET)
+
+
+def _gold_catalog_text() -> str:
+    global _gold_catalog_cache
+    now = time.monotonic()
+    if _gold_catalog_cache is not None:
+        cached_at, text = _gold_catalog_cache
+        if now - cached_at < _GOLD_CATALOG_TTL_S:
+            return text
+    text = _fetch_gold_catalog()
+    _gold_catalog_cache = (now, text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +255,17 @@ def plan_query_node(state: ChatState) -> ChatState:
         }
 
     metric_info = json.dumps(matched, default=str) if matched else "null"
-    metric_templates = _build_metric_templates_text(metrics)
+    metric_templates = _build_metric_templates_text(
+        metrics, state.get("question", "")
+    )
+    gold_catalog = _gold_catalog_text()
 
     prompt = render(
         _load_prompt("sql_planner.md"),
         question=state.get("question", ""),
         metric_info=metric_info,
         metric_templates=metric_templates,
+        gold_catalog=gold_catalog,
     )
 
     llm = _llm()
@@ -200,8 +364,14 @@ Error: {error}
 Original SQL:
 {original_sql}
 
-Fix the SQL so it only uses SELECT on silver.v_latest_observation,
-silver.v_latest_shelf_position, or silver.v_all_platforms.
+Fix the SQL so it is a single SELECT over the allowlisted relations only:
+  Silver: silver.v_latest_observation, silver.v_latest_shelf_position,
+          silver.v_all_platforms
+  Gold:   the dash.* tables and views listed in the planner prompt
+          (prefer dash.v_* views; dash.v_chatbot_availability_city for
+          city-level availability)
+Never reference silver.demo, base scraped tables (silver.blinkit / zepto /
+instamart / jiomart) or the app / ops / auth / storage schemas.
 Output JSON only: {{"sql": "<fixed query>"}}"""
 
     llm = _llm()
