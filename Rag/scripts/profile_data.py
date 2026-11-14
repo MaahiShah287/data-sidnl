@@ -7,7 +7,7 @@ and writes reports/data_profile.md.
 Usage:
     python scripts/profile_data.py
 
-Requires DATABASE_URL in .env (sidnl_chatbot_ro credentials).
+Requires DATABASE_URL in .env (sidnl_chatbot_app credentials).
 No writes. Never reads silver.demo.
 """
 from __future__ import annotations

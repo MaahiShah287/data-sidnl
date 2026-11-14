@@ -28,7 +28,7 @@ Add results from diagnostics here.
 ## Stage A (profile_data.py)
 
 - [OPEN] DATABASE_URL not configured — profiler script has not been run. 
-  To run: (1) copy .env.example to .env, (2) fill in DATABASE_URL with sidnl_chatbot_ro credentials, (3) run: python scripts/profile_data.py
+  To run: (1) copy .env.example to .env, (2) fill in DATABASE_URL with sidnl_chatbot_app credentials, (3) run: python scripts/profile_data.py
   Results must be pasted here before the view TODOs can be filled.
 
 ## Evaluation (run_ground_truth.py, 2026-11-10)

@@ -3,6 +3,11 @@
 -- Purpose: RUN THIS ONE as postgres / Supabase SQL editor to let the chatbot
 --          read the Gold (dash) layer. Safe to re-run; contains no DROP.
 --
+-- Role:    sidnl_chatbot_app is the actual LOGIN role the chatbot connects as
+--          (verified with `select current_user`). It already has Silver access,
+--          so this script only adds Gold (dash) access. There is no
+--          `sidnl_chatbot_ro` role in this database; do not target it.
+--
 -- This is the runnable subset of 03_roles.sql (grants) + the Gold section of
 -- 01_views.sql (safety view). Those files remain the source of truth.
 --
@@ -12,14 +17,15 @@
 -- =============================================================================
 
 -- 1. Schema access ------------------------------------------------------------
-GRANT USAGE ON SCHEMA dash TO sidnl_chatbot_ro;
+GRANT USAGE ON SCHEMA dash TO sidnl_chatbot_app;
 
 -- 2. Read the whole Gold layer ------------------------------------------------
-GRANT SELECT ON ALL TABLES IN SCHEMA dash TO sidnl_chatbot_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA dash TO sidnl_chatbot_app;
 
 -- 3. Keep working as new Gold tables/views appear -----------------------------
+--    (only affects objects created by `postgres`, which owns the Gold refresh)
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA dash
-    GRANT SELECT ON TABLES TO sidnl_chatbot_ro;
+    GRANT SELECT ON TABLES TO sidnl_chatbot_app;
 
 -- 4. Safety view: city-level availability only (store_key IS NULL) ------------
 CREATE OR REPLACE VIEW dash.v_chatbot_availability_city AS
@@ -40,9 +46,10 @@ COMMENT ON VIEW dash.v_chatbot_availability_city IS
     'City-level availability only (store_key IS NULL). Safe to SUM: one row per '
     'SKU x city x day, no per-store rows to double-count.';
 
-GRANT SELECT ON dash.v_chatbot_availability_city TO sidnl_chatbot_ro;
+GRANT SELECT ON dash.v_chatbot_availability_city TO sidnl_chatbot_app;
 
 -- 5. Verify (run separately, as the chatbot role) ------------------------------
+--   SELECT current_user;                                      -- sidnl_chatbot_app
 --   SELECT count(*) FROM dash.metric_catalog;                 -- expect 57
 --   SELECT count(*) FROM dash.v_brand_scorecard_latest;       -- brand rows
 --   SELECT count(*) FROM dash.v_fp_sales_day;                 -- sales days

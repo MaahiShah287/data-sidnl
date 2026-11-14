@@ -250,4 +250,4 @@ COMMENT ON VIEW dash.v_chatbot_availability_city IS
     'City-level availability only (store_key IS NULL). Safe to SUM: one row per '
     'SKU x city x day, no per-store rows to double-count.';
 
-GRANT SELECT ON dash.v_chatbot_availability_city TO sidnl_chatbot_ro;
+GRANT SELECT ON dash.v_chatbot_availability_city TO sidnl_chatbot_app;
