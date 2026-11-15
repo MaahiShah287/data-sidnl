@@ -39,6 +39,76 @@ _UNSUPPORTED_PATTERNS: list[tuple[re.Pattern, str]] = [
     ),
 ]
 
+# Prompt-injection / write attempts. These are matched against the QUESTION,
+# before any LLM call, so a hostile or confused prompt can never reach the
+# planner. Patterns are statement-shaped on purpose: ordinary prose such as
+# "update me on GMV" or "how do I delete a filter" must not be blocked.
+# safe_sql.py remains the hard guarantee; this is the cheap first line.
+_INJECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (
+        re.compile(r"\b(?:drop|truncate)\s+(?:table|view|schema|database|index|role|user)\b"),
+        "a DROP/TRUNCATE statement",
+    ),
+    (
+        re.compile(
+            r"\bdelete\s+(?:all\s+|the\s+|any\s+)*(?:from\b"
+            r"|(?:rows?|records?|data|entries|observations?|everything)\b)"
+        ),
+        "a DELETE statement",
+    ),
+    (re.compile(r"\binsert\s+into\b"), "an INSERT statement"),
+    (
+        re.compile(r"\bupdate\s+[a-z_][\w.]*\s+set\b"),
+        "an UPDATE statement",
+    ),
+    (
+        re.compile(r"\balter\s+(?:table|view|schema|database|index|role|user)\b"),
+        "an ALTER statement",
+    ),
+    (
+        re.compile(r"\bgrant\s+(?:select|insert|update|delete|all|usage|connect)\b"),
+        "a GRANT statement",
+    ),
+    (
+        re.compile(r"\bcreate\s+(?:table|view|schema|database|index|role|user|function)\b"),
+        "a CREATE statement",
+    ),
+    (re.compile(r"\brevoke\s+\w+\s+on\b"), "a REVOKE statement"),
+    (
+        re.compile(r"\bcopy\s+[\w.\"]+\s+(?:from|to)\b"),
+        "a COPY statement",
+    ),
+    (re.compile(r"\bexec\s+[a-z_][\w.]*"), "an EXEC statement"),
+    (re.compile(r"\bexecute\s*\(|\bexecute\s+[a-z_][\w.]*\s*\("), "an EXECUTE statement"),
+    (re.compile(r"\bcall\s+[a-z_][\w.]*\s*\("), "a CALL statement"),
+    (re.compile(r"\bset\s+role\b"), "a SET ROLE statement"),
+]
+
+# Schemas the chatbot must never read. Matching requires an identifier after
+# the dot (so "the app. It ..." in normal prose does not trip the guard).
+_UNAUTHORIZED_SCHEMA_RE = re.compile(
+    r"\b(?:auth|ops|app|storage|pg_catalog|information_schema)\.[a-z_][\w$]*"
+    r"|\bsilver\.demo\b",
+    re.IGNORECASE,
+)
+
+
+def detect_injection(question: str) -> str | None:
+    """
+    Return a short label when the question is a SQL write/DDL statement or a
+    probe of an unauthorized schema; otherwise ``None``.
+
+    Used by both the router (to short-circuit to UNSUPPORTED before the LLM)
+    and the unsupported node (to explain *why* it refused).
+    """
+    lowered = question.lower()
+    for pattern, label in _INJECTION_PATTERNS:
+        if pattern.search(lowered):
+            return label
+    if _UNAUTHORIZED_SCHEMA_RE.search(question):
+        return "a reference to an unauthorized schema"
+    return None
+
 # If a question names a metric, "tell me about X" is answerable, not vague.
 _METRIC_HINTS = {
     "sales", "revenue", "gmv", "units", "asp", "osa", "availability",
@@ -67,6 +137,19 @@ def _build_llm() -> ChatOpenAI:
 
 def _keyword_override(question: str) -> dict | None:
     q_lower = question.lower()
+
+    injection = detect_injection(question)
+    if injection:
+        return {
+            "route": "UNSUPPORTED",
+            "confidence": 0.99,
+            "reason": (
+                f"Question contains {injection}. The chatbot is read-only and "
+                "can only run SELECTs over the curated Silver views and Gold "
+                "(dash) tables."
+            ),
+            "detected_language": _detect_lang(question),
+        }
 
     for pattern, label in _UNSUPPORTED_PATTERNS:
         if pattern.search(q_lower):

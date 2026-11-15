@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 import time
 from graph.state import ChatState
-from graph.router import router_node
+from graph.router import detect_injection, router_node
 
 
 # Only genuinely missing data reaches this node. Sales / revenue / SOV / SOH /
@@ -42,11 +42,20 @@ def unsupported_node(state: ChatState) -> ChatState:
     """Explain what is genuinely missing, point to the metric dictionary."""
     q = state.get("question", "").lower()
 
+    injection = detect_injection(q)
     matched_msg = None
-    for keywords, message in _UNSUPPORTED_RULES:
-        if any(re.search(rf"\b{re.escape(k)}\b", q) for k in keywords):
-            matched_msg = message
-            break
+    if injection:
+        matched_msg = (
+            f"This question contains {injection}. The chatbot is read-only: it "
+            "can only run SELECTs over the curated Silver views and Gold (dash) "
+            "tables, and it cannot read the auth, ops, app, storage, pg_catalog "
+            "or information_schema schemas."
+        )
+    else:
+        for keywords, message in _UNSUPPORTED_RULES:
+            if any(re.search(rf"\b{re.escape(k)}\b", q) for k in keywords):
+                matched_msg = message
+                break
 
     if not matched_msg:
         matched_msg = (

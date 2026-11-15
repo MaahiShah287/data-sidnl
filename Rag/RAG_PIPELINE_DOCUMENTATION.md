@@ -199,6 +199,16 @@ Rules encoded in the router prompt (`src/prompts/router_system.md`, v2.0):
   the old override that sent sales/SOV/SOH/ROAS/clicks/impressions to
   `UNSUPPORTED` was removed. The override also skips the "tell me about…"
   clarification when the question names a metric.
+- **Deterministic pre-router injection guard.** Before any LLM call, the
+  question is matched against statement-shaped DML/DDL patterns (`DROP`,
+  `TRUNCATE`, `DELETE … FROM`, `INSERT INTO`, `UPDATE … SET`, `ALTER`, `GRANT`,
+  `CREATE`, `REVOKE`, `COPY … FROM/TO`, `EXEC`/`EXECUTE`, `CALL`, `SET ROLE`)
+  and unauthorized schema references (`auth.`, `ops.`, `app.`, `storage.`,
+  `pg_catalog.`, `information_schema.`, `silver.demo`). A match routes straight
+  to `UNSUPPORTED` with a read-only explanation — no router tokens, no planner
+  call. Patterns are deliberately statement-shaped so ordinary prose such as
+  *"update me on last week's GMV"* or *"how do I delete a filter?"* is not
+  blocked. `safe_sql.py` remains the hard guarantee if anything slips through.
 
 If the router LLM call throws, the state becomes `AMBIGUOUS` and `router_error`
 is set. That is a deliberate fail-safe: ask a clarifying question rather than
@@ -377,6 +387,7 @@ DEFINITION path stays on documentation.
 | Guardrail | Where | What it prevents |
 |---|---|---|
 | Route classification | `src/graph/router.py` | refusing a supported Gold KPI, or answering genuinely absent data (ETA/Instamart/JioMart/industry share) with a guess |
+| Pre-router injection guard | `src/graph/router.py` | SQL write/DDL statements and `auth`/`ops`/`app`/`storage`/`pg_catalog`/`information_schema` probes reaching the LLM or planner |
 | SQL keyword blocklist | `src/db/safe_sql.py` | writes, DDL, file/system functions |
 | Relation allowlist | `src/db/safe_sql.py` | reading `silver.demo`, base scraped tables, or non-curated `dash.*` relations |
 | Date-column guard | `src/db/schema_guard.py` | inventing a date column (`day`, `report_date`, …) on a Gold relation that has none; the real column list comes from `information_schema` |
@@ -548,7 +559,7 @@ select count(*) from dash.v_chatbot_availability_city;  -- city-total rows only
 ### Verify the install
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q          # 102 tests
+.\.venv\Scripts\python.exe -m pytest -q          # 141 tests
 .\.venv\Scripts\python.exe -m compileall -q src eval scripts tests
 ```
 
@@ -598,7 +609,7 @@ Rag/
 │   ├── api/app.py             FastAPI /health and /chat
 │   ├── graph/
 │   │   ├── main_graph.py      top-level router → subgraph wiring
-│   │   ├── router.py          LLM question classification (+ keyword override)
+│   │   ├── router.py          LLM classification + deterministic keyword/injection guard
 │   │   ├── sql_graph.py       NUMERIC path (Silver + Gold, catalog loader)
 │   │   ├── rag_graph.py       DEFINITION path
 │   │   ├── prompt_utils.py    safe template rendering (handles literal JSON)
@@ -617,7 +628,7 @@ Rag/
 ├── metrics/                   metric_dictionary.yaml, status_vocabulary.md,
 │                              gold_layer.md (Gold definitions for DEFINITION Qs)
 ├── reports/                   committed markdown evidence (bulk output ignored)
-├── tests/                     102 tests
+├── tests/                     141 tests
 └── sql/                       reference SQL
     ├── 01_views.sql           Silver views + Gold map + availability_city view
     ├── 03_roles.sql           canonical Silver+Gold grants, revokes, timeouts
