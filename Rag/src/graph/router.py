@@ -109,6 +109,16 @@ def detect_injection(question: str) -> str | None:
         return "a reference to an unauthorized schema"
     return None
 
+
+# Bare "what is <brand/platform>?" questions are documentation questions. Keep
+# this narrow: "What is Amul's price?" must still go to NUMERIC.
+_ENTITY_DEFINITION_RE = re.compile(
+    r"^\s*(?:what|who)\s+(?:is|are)\s+"
+    r"(?:mr\.?\s+munchies|amul|sidnl|blinkit|zepto)"
+    r"\s*\?*\s*$",
+    re.IGNORECASE,
+)
+
 # If a question names a metric, "tell me about X" is answerable, not vague.
 _METRIC_HINTS = {
     "sales", "revenue", "gmv", "units", "asp", "osa", "availability",
@@ -147,6 +157,17 @@ def _keyword_override(question: str) -> dict | None:
                 f"Question contains {injection}. The chatbot is read-only and "
                 "can only run SELECTs over the curated Silver views and Gold "
                 "(dash) tables."
+            ),
+            "detected_language": _detect_lang(question),
+        }
+
+    if _ENTITY_DEFINITION_RE.match(question):
+        return {
+            "route": "DEFINITION",
+            "confidence": 0.95,
+            "reason": (
+                "Question asks what a tracked brand, platform or SIDNL itself "
+                "is; answered from the documentation corpus."
             ),
             "detected_language": _detect_lang(question),
         }

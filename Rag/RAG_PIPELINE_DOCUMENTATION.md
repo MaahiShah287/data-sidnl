@@ -177,16 +177,22 @@ four routes. The prompt lives in `src/prompts/router_system.md`.
 | Route | Meaning | Example |
 |---|---|---|
 | `NUMERIC` | a number/rate/comparison/list answerable from Silver or Gold | "What was our GMV last month?" |
-| `DEFINITION` | asks what something means | "What is the difference between SOV and SOH?" |
+| `DEFINITION` | asks what something means, or what a brand/platform/SIDNL is | "What is the difference between SOV and SOH?" / "What is Mr. Munchies?" |
 | `UNSUPPORTED` | asks for data SIDNL does not have | "What is the delivery ETA on Blinkit?" |
 | `AMBIGUOUS` | too vague to answer without clarification | "How is Blinkit doing?" |
 
-Rules encoded in the router prompt (`src/prompts/router_system.md`, v2.0):
+Rules encoded in the router prompt (`src/prompts/router_system.md`, v2.1):
 
 - **NUMERIC** covers both layers. Anything that sounds like a KPI is numeric:
   sales, revenue, GMV, units, ASP, growth, OSA, listing, SOV, SOH, price parity,
   ROAS, ad spend, CTR, clicks, impressions, conversion, fill rate,
   serviceability, invoice/pending value.
+- **DEFINITION** also covers brand, platform and company overview questions
+  ("What is Mr. Munchies?", "What is Amul?", "What is SIDNL?", "What is
+  Blinkit?"). Those are answered from the documentation corpus
+  (`docs/brand_and_platform_overview.md`), not from SQL. A bare
+  `what/who is <entity>` question is short-circuited to `DEFINITION` by the
+  keyword override; "What is Amul's price on Blinkit?" still goes to `NUMERIC`.
 - **UNSUPPORTED** is reserved for genuinely absent data:
   - delivery ETA (the column exists but is NULL in every row);
   - any Instamart or JioMart question (no rows);
@@ -339,18 +345,20 @@ remove them.
 
 ### What is indexed
 
-Chroma (persistent, `./chroma_db`, collection `sidnl_docs`) holds **3,910
+Chroma (persistent, `./chroma_db`, collection `sidnl_docs`) holds **3,959
 documents**:
 
 | Kind | Count | Built from |
 |---|---|---|
 | `data_rows` | 3,813 | chunks of 25 rows from the three Silver views |
 | `metric` | 37 | one per metric in `metrics/metric_dictionary.yaml` |
-| `documentation` | 60 | one per markdown heading in `metrics/*.md` and `docs/**/*.md` |
+| `documentation` | 109 | one per markdown heading in `metrics/*.md` and `docs/**/*.md` |
 
-`metrics/gold_layer.md` is the newest documentation source: it explains the Gold
-(`dash`) layer, OSA, SOH vs SOV, roll-up rules, first-party tables, serviceability
-and freshness, and is what the DEFINITION path cites for Gold questions.
+`metrics/gold_layer.md` explains the Gold (`dash`) layer, OSA, SOH vs SOV,
+roll-up rules, first-party tables, serviceability and freshness, and is what the
+DEFINITION path cites for Gold questions. `docs/brand_and_platform_overview.md`
+explains SIDNL, the primary brand (Mr. Munchies) and the competitor benchmark
+(Amul), and is what brand / platform questions cite.
 
 Embeddings: `intfloat/multilingual-e5-base`, computed locally (CPU). No API key
 needed for embeddings.
@@ -559,7 +567,7 @@ select count(*) from dash.v_chatbot_availability_city;  -- city-total rows only
 ### Verify the install
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q          # 141 tests
+.\.venv\Scripts\python.exe -m pytest -q          # 158 tests
 .\.venv\Scripts\python.exe -m compileall -q src eval scripts tests
 ```
 
@@ -628,7 +636,7 @@ Rag/
 ├── metrics/                   metric_dictionary.yaml, status_vocabulary.md,
 │                              gold_layer.md (Gold definitions for DEFINITION Qs)
 ├── reports/                   committed markdown evidence (bulk output ignored)
-├── tests/                     141 tests
+├── tests/                     158 tests
 └── sql/                       reference SQL
     ├── 01_views.sql           Silver views + Gold map + availability_city view
     ├── 03_roles.sql           canonical Silver+Gold grants, revokes, timeouts
