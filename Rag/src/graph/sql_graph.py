@@ -84,12 +84,45 @@ def _matching_metrics(question: str, metrics: list[dict]) -> list[dict]:
             scored.append((score, -order, m))
 
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [m for _, _, m in scored]
+    ordered = [m for _, _, m in scored]
+    return _prefer_silver_price_metric(question, ordered)
 
 
 def _match_metric(question: str, metrics: list[dict]) -> dict | None:
     matches = _matching_metrics(question, metrics)
     return matches[0] if matches else None
+
+
+# "What is the average selling price of Mr. Munchies on Blinkit?" is a
+# marketplace price question, but the `asp` alias (Gold first-party GMV/units)
+# wins on phrase length. When the question names a marketplace platform and a
+# price word, prefer the Silver `current_price` metric.
+_MARKETPLACE_PLATFORM_RE = re.compile(r"\b(?:blinkit|zepto)\b", re.IGNORECASE)
+_MARKETPLACE_PRICE_RE = re.compile(
+    r"\b(?:price|prices|mrp|sp|selling\s+price|sale\s+price)\b", re.IGNORECASE
+)
+_FIRST_PARTY_PRICE_METRICS = frozenset({"asp"})
+
+
+def _prefer_silver_price_metric(question: str, ordered: list[dict]) -> list[dict]:
+    """
+    Put `current_price` ahead of `asp` for a marketplace price question.
+
+    Only fires when the question names Blinkit/Zepto and a price word, the
+    Silver metric is present, and the first-party metric is currently first.
+    """
+    if not ordered or ordered[0].get("name") not in _FIRST_PARTY_PRICE_METRICS:
+        return ordered
+    if not (
+        _MARKETPLACE_PLATFORM_RE.search(question)
+        and _MARKETPLACE_PRICE_RE.search(question)
+    ):
+        return ordered
+    silver = [m for m in ordered if m.get("name") == "current_price"]
+    if not silver:
+        return ordered
+    rest = [m for m in ordered if m.get("name") != "current_price"]
+    return silver + rest
 
 
 def _build_metric_templates_text(
@@ -365,8 +398,10 @@ Original SQL:
 {original_sql}
 
 Fix the SQL so it is a single SELECT over the allowlisted relations only:
-  Silver: silver.v_latest_observation, silver.v_latest_shelf_position,
-          silver.v_all_platforms
+  Silver: silver.v_all_platforms (preferred for a filtered price/stock question:
+          inline the DISTINCT ON, as the planner prompt shows),
+          silver.v_latest_observation, silver.v_latest_shelf_position
+          (the two latest views are slow when filtered: ~9 s)
   Gold:   the dash.* tables and views listed in the planner prompt
           (prefer dash.v_* views; dash.v_chatbot_availability_city for
           city-level availability)

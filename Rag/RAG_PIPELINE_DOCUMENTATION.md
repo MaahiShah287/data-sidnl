@@ -76,6 +76,42 @@ Three read-only Postgres views back the Silver path:
 | `silver.v_latest_observation` | ~5,055 | latest price/availability/discount per listing+store |
 | `silver.v_latest_shelf_position` | ~33,991 | latest shelf position/ad data per listing+store |
 
+**Performance: filtered reads on the two `v_latest_*` views.** Both views are a
+`DISTINCT ON (platform, listing, store) … ORDER BY … observed_at DESC` over
+`v_all_platforms`, which is a 4-branch `UNION ALL` over `silver.blinkit`,
+`silver.zepto`, `silver.instamart`, `silver.jiomart`. Postgres cannot push a
+`brand`/`product`/`city` filter through a `DISTINCT ON`, so a filtered query
+rebuilds and sorts every row in the union (`silver.blinkit` alone is 245k rows
+and had no indexes). That measured **8.9 s execution / 10.3 s wall**, tripping
+the 10 s `statement_timeout`.
+
+Two layers fix it:
+
+1. **App-side deterministic rewrite** (`src/db/silver_fast_path.py`, called from
+   `validate_and_sanitise`). A single-table query on `v_latest_observation` /
+   `v_latest_shelf_position` that has at least one identity/scope predicate
+   (`brand`, `platform`, `city`, `store_id`, `product_name`, …) is rewritten to
+   an inline `DISTINCT ON` over `silver.v_all_platforms` with those predicates
+   **inside** the subquery, so the filter is pushed down. Value predicates
+   (`sale_price > 100`, `availability = true`, `observed_at`) stay outside to
+   preserve "latest row" semantics. The rewrite is idempotent, leaves unfiltered
+   or joined queries alone, and still passes the allowlist. Warm: **150–220 ms**
+   for brand+platform, **80–190 ms** for product+city.
+2. **Owner-run materialised views + base-table indexes**
+   (`sql/05_latest_observation_mv.sql`). Materialises each latest view once,
+   indexes it, repoints `v_latest_observation` / `v_latest_shelf_position` at
+   the MV, and adds ordered partial indexes on the four base platform tables
+   (`(brand, source_type, listing, store, observed_at DESC) WHERE
+   data_quality_status = 'valid'`). A `pg_cron` job refreshes the MVs every 15
+   minutes with `CONCURRENTLY`. This is the permanent fix for unfiltered reads
+   and for any other client of the views; the chatbot role is read-only and
+   cannot create these objects, so the owner must run the script.
+
+The metric templates for `current_price`, `observed_in_stock_rate`,
+`observed_oos_rate`, `avg_discount_pct`, `ad_placement_rate` and
+`avg_organic_position` already use the inline pattern, and the planner prompt
+documents it ("Silver performance rule").
+
 The Gold path reads the curated `dash.*` tables/views directly. `dash` has 30
 tables and 25 views; `sql/01_views.sql` documents the map and
 `dash.metric_catalog` is the authoritative 57-metric list (formula, status,
@@ -281,7 +317,15 @@ HTTP 413.
    `information_schema` into `src/db/dash_schema.py`, so `day` on
    `dash.v_fp_ad_page` is rejected before Postgres sees it, and the model is
    told the relation's real date columns (or that it has none);
-6. appends `LIMIT 200` if no limit is present.
+6. **rewrites filtered latest-view queries to the fast path**
+   (`src/db/silver_fast_path.py`): a single-table `SELECT` on
+   `silver.v_latest_observation` / `silver.v_latest_shelf_position` with a
+   scope predicate becomes an inline `DISTINCT ON` over
+   `silver.v_all_platforms` with the predicate pushed into the subquery. Value
+   predicates stay outside so the "latest row" meaning is unchanged. The rewrite
+   is idempotent and leaves unfiltered/joined queries untouched. It sets
+   `SafeResult.rewritten_for_performance`;
+7. appends `LIMIT 200` if no limit is present.
 
 **execute_sql** — `src/db/client.py` runs the query through a connection pool
 whose connections are created with:
@@ -567,7 +611,7 @@ select count(*) from dash.v_chatbot_availability_city;  -- city-total rows only
 ### Verify the install
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q          # 158 tests
+.\.venv\Scripts\python.exe -m pytest -q          # 208 tests
 .\.venv\Scripts\python.exe -m compileall -q src eval scripts tests
 ```
 
@@ -624,6 +668,7 @@ Rag/
 │   │   └── state.py           shared ChatState schema
 │   ├── db/
 │   │   ├── safe_sql.py        SQL firewall / Silver+Gold allowlist / LIMIT injection
+│   │   ├── silver_fast_path.py  inline DISTINCT ON rewrite for filtered latest views
 │   │   ├── schema_guard.py    rejects impossible date columns on dash.* relations
 │   │   ├── dash_schema.py     generated: exact dash.* columns + date-column map
 │   │   └── client.py          read-only pool, 10 s timeout, bulk connection
@@ -636,11 +681,12 @@ Rag/
 ├── metrics/                   metric_dictionary.yaml, status_vocabulary.md,
 │                              gold_layer.md (Gold definitions for DEFINITION Qs)
 ├── reports/                   committed markdown evidence (bulk output ignored)
-├── tests/                     158 tests
+├── tests/                     208 tests
 └── sql/                       reference SQL
     ├── 01_views.sql           Silver views + Gold map + availability_city view
     ├── 03_roles.sql           canonical Silver+Gold grants, revokes, timeouts
-    └── 04_gold_access.sql     safe, re-runnable script for the owner to unblock Gold
+    ├── 04_gold_access.sql     safe, re-runnable script for the owner to unblock Gold
+    └── 05_latest_observation_mv.sql  owner-run MV + partial indexes + pg_cron refresh
 ```
 
 ---
@@ -664,6 +710,26 @@ col.query(...)         # returns hits
 ```
 
 If those work, the index is fine and the error is cosmetic. Do not re-embed.
+
+**A Silver price/stock question times out at 10 s (`QueryCanceled`).**
+The query is reading `silver.v_latest_observation` / `v_latest_shelf_position`
+through the `DISTINCT ON` instead of the fast path. Check the `sql` field: it
+should read `FROM silver.v_all_platforms` with the `DISTINCT ON` inlined and the
+brand/product/platform/city filter **inside** the subquery. If it still reads
+the view, the rewrite did not fire (no scope predicate, or a join). The
+deterministic rewrite lives in `src/db/silver_fast_path.py`; the metric
+templates in `metrics/metric_dictionary.yaml` use the same pattern. For a
+permanent fix (and unfiltered reads), have the owner run
+`sql/05_latest_observation_mv.sql` — it materialises both views, adds ordered
+partial indexes on the base platform tables, and schedules a 15-minute
+`CONCURRENTLY` refresh.
+
+**A Silver price question returns first-party ASP instead of the marketplace price.**
+`asp` is Gold GMV/units; a Blinkit/Zepto price question must use the Silver
+`current_price` metric. `_prefer_silver_price_metric()` in
+`src/graph/sql_graph.py` moves `current_price` ahead of `asp` when the question
+names Blinkit/Zepto and a price word. If a new phrasing slips through, extend
+`_MARKETPLACE_PRICE_RE`.
 
 **Answers are slow (60–90 s) on DEFINITION questions.**
 The RAG path makes several LLM calls (grade each chunk, generate, verify).

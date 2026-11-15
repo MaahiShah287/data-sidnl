@@ -123,11 +123,34 @@ _ENTITY_DEFINITION_RE = re.compile(
 _METRIC_HINTS = {
     "sales", "revenue", "gmv", "units", "asp", "osa", "availability",
     "listing", "stockout", "soh", "share of shelf", "sov", "share of voice",
-    "discount", "price", "parity", "roas", "ad spend", "clicks",
-    "impressions", "ctr", "cpc", "cpm", "cvr", "conversion", "fill rate",
-    "serviceab", "invoice", "pending", "stock", "inventory", "rank",
-    "freshness", "doi",
+    "discount", "price", "mrp", "selling price", "sale price", "parity",
+    "roas", "ad spend", "clicks", "impressions", "ctr", "cpc", "cpm", "cvr",
+    "conversion", "fill rate", "serviceab", "invoice", "pending", "stock",
+    "in stock", "available", "inventory", "rank", "shelf position",
+    "sponsored", "freshness", "doi",
 }
+
+# Silver price/stock/shelf questions are NUMERIC, but the router LLM sometimes
+# labels them UNSUPPORTED because the metric dictionary has no "price" KPI
+# (price lives in Silver, not in the Gold catalog). This deterministic guard
+# rescues them, without ever overriding a genuinely absent data source
+# (Instamart/JioMart/ETA/market size) or a write attempt.
+_SILVER_METRIC_RE = re.compile(
+    r"\b(?:price|prices|pricing|mrp|sale\s+price|selling\s+price|"
+    r"discount|stock|in\s*stock|out\s+of\s+stock|stockout|availability|"
+    r"available|inventory|shelf\s+(?:position|rank)|sponsored|ad\s+placement)\b",
+    re.IGNORECASE,
+)
+_TRACKED_ENTITY_RE = re.compile(
+    r"\b(?:mr\.?\s+munchies|amul|mother\s+dairy|sidnl|blinkit|zepto)\b",
+    re.IGNORECASE,
+)
+# Do not turn a "what does X mean / what is the strategy" question into SQL.
+_DEFINITION_HINT_RE = re.compile(
+    r"\b(?:meaning|definition|define|strategy|calculated|formula|"
+    r"what\s+does\b|how\s+is\b.*\b(?:calculated|defined))\b",
+    re.IGNORECASE,
+)
 
 _CLARIFY_TRIGGERS = {
     "how is it doing", "how are they doing", "tell me about",
@@ -194,6 +217,39 @@ def _keyword_override(question: str) -> dict | None:
     return None
 
 
+def _silver_numeric_override(question: str, route: str) -> dict | None:
+    """
+    Rescue a Silver price/stock/shelf question that the router LLM mislabelled.
+
+    Fires only when the question names both a Silver metric (price, MRP,
+    discount, stock, availability, shelf position) and a tracked brand or
+    platform, and never for a genuine UNSUPPORTED case (Instamart, JioMart,
+    delivery ETA, industry market size), a write attempt, or a
+    meaning/definition question.
+    """
+    if route == "NUMERIC":
+        return None
+    if detect_injection(question):
+        return None
+    if _DEFINITION_HINT_RE.search(question):
+        return None
+    q_lower = question.lower()
+    for pattern, _ in _UNSUPPORTED_PATTERNS:
+        if pattern.search(q_lower):
+            return None
+    if not (_SILVER_METRIC_RE.search(question) and _TRACKED_ENTITY_RE.search(question)):
+        return None
+    return {
+        "route": "NUMERIC",
+        "confidence": 0.9,
+        "reason": (
+            "Question asks for a Silver price/stock/shelf metric for a tracked "
+            "brand or platform; answered from silver.v_all_platforms."
+        ),
+        "detected_language": _detect_lang(question),
+    }
+
+
 def _detect_lang(text: str) -> str:
     """Heuristic: check for Devanagari script or common Hinglish markers."""
     if any("\u0900" <= ch <= "\u097f" for ch in text):
@@ -226,6 +282,9 @@ def router_node(state: ChatState) -> ChatState:
         try:
             response = llm.invoke(messages)
             result = json.loads(response.content)
+            rescue = _silver_numeric_override(question, result.get("route", ""))
+            if rescue:
+                result = rescue
         except Exception as exc:
             # Fail safe: route to AMBIGUOUS so the user gets a clarifying question
             router_error = f"{type(exc).__name__}: {exc}"

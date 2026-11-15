@@ -1,5 +1,5 @@
 # SQL Planner Prompt
-# Version: 2.0 — Silver + Gold (dash)
+# Version: 2.1 — Silver fast path (inline DISTINCT ON); marketplace price ≠ first-party ASP
 # Used by: src/graph/sql_graph.py — plan_query node
 
 You generate a read-only Postgres SELECT statement to answer the user's question
@@ -15,6 +15,49 @@ readings) and the **Gold** layer (`dash` schema, pre-aggregated dashboard KPIs).
 - **silver.v_latest_shelf_position** — position, is_ad, ad_type, organic_position
   (one row per platform+listing+store, source_type='shelf_position')
 - **silver.v_all_platforms** — all rows, both source types, filtered to valid quality
+
+**Silver performance rule — read this before writing Silver SQL.**
+`v_latest_observation` and `v_latest_shelf_position` are `DISTINCT ON` views
+over `silver.v_all_platforms`. Postgres cannot push a brand/product/platform/
+store filter through that `DISTINCT ON`, so a filtered query on either view
+scans and sorts every row (about 9 s — past the 10 s statement timeout). When
+the question filters by brand, product_name, platform, city or store, write
+the `DISTINCT ON` inline over `silver.v_all_platforms` and put **every** filter
+inside the subquery:
+
+```sql
+SELECT platform, city, product_name,
+       COUNT(*)                             AS store_listings,
+       COUNT(*) FILTER (WHERE availability) AS in_stock_listings,
+       MIN(sale_price)                      AS min_sale_price,
+       MAX(sale_price)                      AS max_sale_price,
+       MAX(mrp)                             AS mrp,
+       MAX(observed_at)                     AS last_observed_at
+FROM (
+  SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+         platform, city, store_id, product_name, mrp, sale_price,
+         discount_percentage, availability, observed_at
+  FROM silver.v_all_platforms
+  WHERE source_type = 'observation'      -- 'shelf_position' for rank/ad questions
+    AND brand = 'Mr. Munchies'
+    AND platform = 'blinkit'
+  ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+           observed_at DESC
+) latest
+GROUP BY platform, city, product_name
+ORDER BY platform, city, product_name
+```
+
+That pattern runs in about 150–220 ms. Use the plain views only for an
+unfiltered "latest everything" listing. The permanent fix (owner-run
+materialized view) is `Rag/sql/05_latest_observation_mv.sql`.
+
+**Marketplace price ≠ first-party sales.** For price, MRP, selling price,
+discount, stock or availability of a brand/SKU on Blinkit or Zepto, use the
+Silver fast pattern above. `dash.fp_sales_*` (and the `asp` metric) are
+first-party GMV/units and will return 0 rows for a marketplace question.
+Aggregate a brand-level price question to platform x city x product (as in
+the template); do not return thousands of store-level rows.
 
 Silver columns (the three views share the same schema):
 Identity: platform, listing_id, product_id, store_id, run_id, scrape_run_id
@@ -208,6 +251,13 @@ and do not filter or group by date.
     (`v_fp_ad_wallet_day.ad_spend`) are the money actually spent; page spend
     (`v_fp_ad_page.spend`) is campaign-level reported spend. Use the wallet for
     "how much did we spend", the page for campaign ROAS/CTR.
+13. **Filtered Silver questions use the inline `DISTINCT ON` over
+    `silver.v_all_platforms`** (see the Silver performance rule). Never put a
+    brand/product/platform/store filter on `v_latest_observation` or
+    `v_latest_shelf_position`: that path takes about 9 s and times out.
+14. **Marketplace price ≠ first-party ASP.** A price/MRP/discount/stock
+    question about a brand or SKU on Blinkit or Zepto is Silver; do not answer
+    it from `dash.fp_sales_*` or the `asp` metric.
 
 ## Silver literal values (match EXACTLY; Postgres string comparison is case-sensitive)
 

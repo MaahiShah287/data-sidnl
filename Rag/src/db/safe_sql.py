@@ -10,6 +10,7 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from db.schema_guard import find_bad_date_column
+from db.silver_fast_path import rewrite_latest_views
 
 # ---------------------------------------------------------------------------
 # Allowlist
@@ -132,6 +133,7 @@ DEFAULT_LIMIT = 200
 class SafeResult:
     sanitised_sql: str
     limit_was_added: bool
+    rewritten_for_performance: bool = False
     rows: list[dict[str, Any]] = field(default_factory=list)
     row_count: int = 0
     observed_at_min: str | None = None
@@ -215,6 +217,12 @@ def validate_and_sanitise(raw_sql: str) -> SafeResult:
         raise SQLValidationError("Rejected: empty SQL.")
     sql = _strip_semi(raw_sql.strip())
     _check_blocked(sql)
+    # Deterministic fast path: a filtered query on v_latest_observation /
+    # v_latest_shelf_position is rewritten to an inline DISTINCT ON over
+    # v_all_platforms so the filter is pushed down (see db/silver_fast_path.py).
+    # The rewrite is semantic-preserving (scope columns only) and idempotent.
+    sql, rewritten = rewrite_latest_views(sql)
+    _check_blocked(sql)
     parsed = _parse(sql)
     rels = _relations(parsed)
     for r in rels:
@@ -248,7 +256,11 @@ def validate_and_sanitise(raw_sql: str) -> SafeResult:
     had_limit = _has_limit(parsed)
     if not had_limit:
         sql = f"{sql}\nLIMIT {DEFAULT_LIMIT}"
-    return SafeResult(sanitised_sql=sql, limit_was_added=not had_limit)
+    return SafeResult(
+        sanitised_sql=sql,
+        limit_was_added=not had_limit,
+        rewritten_for_performance=rewritten,
+    )
 
 
 def validate_and_sanitise_safe(raw_sql: str) -> tuple[SafeResult | None, str | None]:

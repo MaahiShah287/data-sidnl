@@ -32,12 +32,16 @@ metrics:
     status: draft
     aliases: [in stock rate, instock rate, availability rate, oos rate]
     definition: >
-      count(availability = true) / count(availability IS NOT NULL)
-      on silver.v_latest_observation.
+      count(availability = true) / count(availability IS NOT NULL) over the
+      latest observation per platform+listing+store.
       NULL availability rows are EXCLUDED from both numerator and denominator.
+      Read from silver.v_all_platforms with the DISTINCT ON inlined so the
+      brand/product/platform filter is pushed down (see the Silver performance
+      rule in sql_planner.md); the plain v_latest_observation view scans and
+      sorts every row and exceeds the 10 s statement timeout.
       OPEN QUESTION: Confirm with analytics mentor whether NULL should be a
       separate bucket or excluded entirely.
-    source_view: silver.v_latest_observation
+    source_view: silver.v_all_platforms
     sql_template: |
       SELECT
         platform,
@@ -48,11 +52,16 @@ metrics:
           COUNT(*) FILTER (WHERE availability = true)::numeric /
           NULLIF(COUNT(*) FILTER (WHERE availability IS NOT NULL), 0) * 100,
         2) AS in_stock_rate_pct,
-        MIN(observed_at) AS observed_at_min,
-        MAX(observed_at) AS observed_at_max
-      FROM silver.v_latest_observation
-      WHERE 1=1
-        {where_clauses}
+        MAX(observed_at) AS last_observed_at
+      FROM (
+        SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+               platform, city, store_id, availability, observed_at
+        FROM silver.v_all_platforms
+        WHERE source_type = 'observation'
+          {where_clauses}
+        ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+                 observed_at DESC
+      ) latest
       GROUP BY platform, city
       ORDER BY platform, city
     grain: platform x city x (optional brand/category)
@@ -68,8 +77,9 @@ metrics:
     status: draft
     aliases: [out of stock rate, oos]
     definition: >
-      1 - observed_in_stock_rate. Same denominator (excludes NULL availability).
-    source_view: silver.v_latest_observation
+      1 - observed_in_stock_rate. Same denominator (excludes NULL availability)
+      and same inlined DISTINCT ON over silver.v_all_platforms fast path.
+    source_view: silver.v_all_platforms
     sql_template: |
       SELECT
         platform,
@@ -78,11 +88,16 @@ metrics:
           COUNT(*) FILTER (WHERE availability = false)::numeric /
           NULLIF(COUNT(*) FILTER (WHERE availability IS NOT NULL), 0) * 100,
         2) AS oos_rate_pct,
-        MIN(observed_at) AS observed_at_min,
-        MAX(observed_at) AS observed_at_max
-      FROM silver.v_latest_observation
-      WHERE 1=1
-        {where_clauses}
+        MAX(observed_at) AS last_observed_at
+      FROM (
+        SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+               platform, city, store_id, availability, observed_at
+        FROM silver.v_all_platforms
+        WHERE source_type = 'observation'
+          {where_clauses}
+        ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+                 observed_at DESC
+      ) latest
       GROUP BY platform, city
       ORDER BY platform, city
     grain: platform x city x (optional brand/category)
@@ -95,22 +110,30 @@ metrics:
     status: draft
     aliases: [discount, discount percentage, discount percent]
     definition: >
-      avg(discount_percentage) where mrp > 0, using simple average, from the
-      raw silver observations. For the Gold dashboard discount use
+      avg(discount_percentage) where mrp > 0, using simple average, over the
+      latest observation per platform+listing+store. Read from
+      silver.v_all_platforms with the DISTINCT ON inlined so filters push down
+      (Silver performance rule). For the Gold dashboard discount use
       gold_discount_pct instead.
-    source_view: silver.v_latest_observation
+    source_view: silver.v_all_platforms
     sql_template: |
       SELECT
         platform,
         city,
         ROUND(AVG(discount_percentage), 2) AS avg_discount_pct,
         COUNT(*) AS listing_count,
-        MIN(observed_at) AS observed_at_min,
-        MAX(observed_at) AS observed_at_max
-      FROM silver.v_latest_observation
-      WHERE mrp > 0
-        AND discount_percentage IS NOT NULL
-        {where_clauses}
+        MAX(observed_at) AS last_observed_at
+      FROM (
+        SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+               platform, city, store_id, mrp, discount_percentage, observed_at
+        FROM silver.v_all_platforms
+        WHERE source_type = 'observation'
+          AND mrp > 0
+          {where_clauses}
+        ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+                 observed_at DESC
+      ) latest
+      WHERE discount_percentage IS NOT NULL
       GROUP BY platform, city
       ORDER BY platform, city
     grain: platform x city x (optional brand/category)
@@ -121,20 +144,43 @@ metrics:
   - name: current_price
     layer: silver
     status: draft
-    aliases: [price, selling price, mrp, sp]
+    aliases: [price, selling price, sale price, mrp, sp, current price]
     definition: >
-      Latest sale_price and mrp per listing and store from
-      silver.v_latest_observation.
-    source_view: silver.v_latest_observation
+      Latest sale_price, MRP and discount per platform+listing+store, rolled up
+      to platform x city x product so a brand/SKU question returns a readable
+      price range instead of thousands of store rows. Read from
+      silver.v_all_platforms with the DISTINCT ON inlined so the brand/product/
+      platform filter is pushed down (Silver performance rule).
+      sale_price is NULL for out-of-stock listings, so the price aggregates use
+      in-stock rows only; in_stock_listings shows coverage. Group by
+      store_name instead of city only when the question names a specific store.
+    source_view: silver.v_all_platforms
     sql_template: |
       SELECT
-        platform, product_name, sku_name, brand, city, store_name,
-        mrp, sale_price, discount_percentage, currency, observed_at
-      FROM silver.v_latest_observation
-      WHERE 1=1
-        {where_clauses}
+        platform,
+        city,
+        product_name,
+        COUNT(*)                             AS store_listings,
+        COUNT(*) FILTER (WHERE availability) AS in_stock_listings,
+        MIN(sale_price)                      AS min_sale_price,
+        MAX(sale_price)                      AS max_sale_price,
+        ROUND(AVG(sale_price), 2)            AS avg_sale_price,
+        MAX(mrp)                             AS mrp,
+        MAX(discount_percentage)             AS discount_pct,
+        MAX(observed_at)                     AS last_observed_at
+      FROM (
+        SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+               platform, city, store_id, product_name, mrp, sale_price,
+               discount_percentage, availability, observed_at
+        FROM silver.v_all_platforms
+        WHERE source_type = 'observation'
+          {where_clauses}
+        ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+                 observed_at DESC
+      ) latest
+      GROUP BY platform, city, product_name
       ORDER BY platform, city, product_name
-    grain: platform x listing x store
+    grain: platform x city x product (latest per listing+store before aggregation)
     required_filters:
       - product_name or brand (at least one recommended to limit result set)
     open_questions: []
@@ -144,9 +190,11 @@ metrics:
     status: draft
     aliases: [ad rate, sponsored share, ad share]
     definition: >
-      count(*) FILTER (WHERE is_ad = true) / count(*) on
-      silver.v_latest_shelf_position.
-    source_view: silver.v_latest_shelf_position
+      count(*) FILTER (WHERE is_ad = true) / count(*) over the latest
+      shelf-position reading per platform+listing+store. Read from
+      silver.v_all_platforms with source_type='shelf_position' and the
+      DISTINCT ON inlined so filters push down (Silver performance rule).
+    source_view: silver.v_all_platforms
     sql_template: |
       SELECT
         platform,
@@ -157,11 +205,16 @@ metrics:
           COUNT(*) FILTER (WHERE is_ad = true)::numeric /
           NULLIF(COUNT(*), 0) * 100,
         2) AS ad_placement_rate_pct,
-        MIN(observed_at) AS observed_at_min,
-        MAX(observed_at) AS observed_at_max
-      FROM silver.v_latest_shelf_position
-      WHERE 1=1
-        {where_clauses}
+        MAX(observed_at) AS last_observed_at
+      FROM (
+        SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+               platform, city, store_id, is_ad, observed_at
+        FROM silver.v_all_platforms
+        WHERE source_type = 'shelf_position'
+          {where_clauses}
+        ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+                 observed_at DESC
+      ) latest
       GROUP BY platform, city
       ORDER BY platform, city
     grain: platform x city x (optional category)
@@ -174,19 +227,27 @@ metrics:
     status: draft
     aliases: [organic position, position, rank]
     definition: >
-      avg(organic_position) per brand and category from
-      silver.v_latest_shelf_position. NULL organic_position rows are excluded.
-    source_view: silver.v_latest_shelf_position
+      avg(organic_position) per brand and category over the latest
+      shelf-position reading per platform+listing+store, read from
+      silver.v_all_platforms with the DISTINCT ON inlined (Silver performance
+      rule). NULL organic_position rows are excluded.
+    source_view: silver.v_all_platforms
     sql_template: |
       SELECT
         platform, city, brand, l1_category,
         ROUND(AVG(organic_position), 2) AS avg_organic_position,
         COUNT(*) AS listing_count,
-        MIN(observed_at) AS observed_at_min,
-        MAX(observed_at) AS observed_at_max
-      FROM silver.v_latest_shelf_position
+        MAX(observed_at) AS last_observed_at
+      FROM (
+        SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
+               platform, city, store_id, brand, l1_category, organic_position, observed_at
+        FROM silver.v_all_platforms
+        WHERE source_type = 'shelf_position'
+          {where_clauses}
+        ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
+                 observed_at DESC
+      ) latest
       WHERE organic_position IS NOT NULL
-        {where_clauses}
       GROUP BY platform, city, brand, l1_category
       ORDER BY platform, city, avg_organic_position
     grain: platform x city x brand x l1_category
