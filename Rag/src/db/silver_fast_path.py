@@ -7,8 +7,9 @@ Why
 `DISTINCT ON (...) ... FROM silver.v_all_platforms` views. Postgres cannot push
 a brand / product / platform / city / store filter through the DISTINCT ON, so
 a filtered query on either view rebuilds and sorts every row in
-`v_all_platforms` (a 4-branch UNION ALL over the Silver platform tables;
-`silver.blinkit` alone is 245k rows and had no indexes). Measured 8.9 s for a
+`v_all_platforms` (a 4-branch UNION ALL over `silver.blinkit` / `zepto` /
+`instamart` / `jiomart`, which are views over `silver.v_wide`; its physical
+fact table is `silver.fact_product_reading`, 260k rows). Measured 8.9 s for a
 simple brand+platform price query, which trips the 10 s statement_timeout.
 
 What
@@ -38,10 +39,11 @@ down, because they would select a different "latest" row.
 
 The permanent fix is the owner-run materialized view in
 `Rag/sql/05_latest_observation_mv.sql`; this rewrite keeps the chatbot fast in
-the meantime. The owner script also adds ordered partial indexes on the base
-platform tables, so the inline path stays fast after the views are repointed
-(the rewrite matches by view name, so it still fires and reads the base tables
-directly).
+the meantime. The owner script also adds a selective partial index on the real
+table `silver.fact_product_reading` (the four `silver.blinkit/zepto/...`
+relations are views), so the inline path stays fast after the views are
+repointed (the rewrite matches by view name, so it still fires and reads the
+base tables directly).
 """
 from __future__ import annotations
 

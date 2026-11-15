@@ -79,11 +79,15 @@ Three read-only Postgres views back the Silver path:
 **Performance: filtered reads on the two `v_latest_*` views.** Both views are a
 `DISTINCT ON (platform, listing, store) … ORDER BY … observed_at DESC` over
 `v_all_platforms`, which is a 4-branch `UNION ALL` over `silver.blinkit`,
-`silver.zepto`, `silver.instamart`, `silver.jiomart`. Postgres cannot push a
+`silver.zepto`, `silver.instamart`, `silver.jiomart`. Those four are **views**
+over `silver.v_wide`, a 6-way join whose physical fact table is
+`silver.fact_product_reading` (260k rows). Postgres cannot push a
 `brand`/`product`/`city` filter through a `DISTINCT ON`, so a filtered query
-rebuilds and sorts every row in the union (`silver.blinkit` alone is 245k rows
-and had no indexes). That measured **8.9 s execution / 10.3 s wall**, tripping
-the 10 s `statement_timeout`.
+rebuilds and sorts every row in the union. The fact table has indexes
+(`ix_reading_prod_store_time`, `ix_reading_source_time`, …), but none is
+restricted to the rows the latest views read, so each product still fetches
+every reading. That measured **8.9 s execution / 10.3 s wall**, tripping the
+10 s `statement_timeout`.
 
 Two layers fix it:
 
@@ -97,14 +101,20 @@ Two layers fix it:
    preserve "latest row" semantics. The rewrite is idempotent, leaves unfiltered
    or joined queries alone, and still passes the allowlist. Warm: **150–220 ms**
    for brand+platform, **80–190 ms** for product+city.
-2. **Owner-run materialised views + base-table indexes**
+2. **Owner-run materialised views + physical base-table index**
    (`sql/05_latest_observation_mv.sql`). Materialises each latest view once,
    indexes it, repoints `v_latest_observation` / `v_latest_shelf_position` at
-   the MV, and adds ordered partial indexes on the four base platform tables
-   (`(brand, source_type, listing, store, observed_at DESC) WHERE
-   data_quality_status = 'valid'`). A `pg_cron` job refreshes the MVs every 15
-   minutes with `CONCURRENTLY`. This is the permanent fix for unfiltered reads
-   and for any other client of the views; the chatbot role is read-only and
+   the MV, and adds one selective partial index on the real table
+   `silver.fact_product_reading`: `(product_key, store_key, observed_at DESC)
+   WHERE dq_status = 'valid' AND (CASE source_type WHEN 'stock_check' THEN
+   'observation' ELSE 'shelf_position' END) = 'observation'` (16k of 260k
+   rows). The `CASE` is deliberate: the views expose the mapped source type and
+   Postgres does not simplify it back to `source_type = 'stock_check'`, so a
+   plain-column predicate would never be chosen. The shelf slice is ~94% of the
+   table, where the existing indexes are already appropriate. A `pg_cron` job
+   refreshes the MVs every 15 minutes with `CONCURRENTLY`. This is the permanent
+   fix for unfiltered reads and for any other client of the views; the chatbot
+   role is read-only and
    cannot create these objects, so the owner must run the script.
 
 The metric templates for `current_price`, `observed_in_stock_rate`,
@@ -720,8 +730,10 @@ the view, the rewrite did not fire (no scope predicate, or a join). The
 deterministic rewrite lives in `src/db/silver_fast_path.py`; the metric
 templates in `metrics/metric_dictionary.yaml` use the same pattern. For a
 permanent fix (and unfiltered reads), have the owner run
-`sql/05_latest_observation_mv.sql` — it materialises both views, adds ordered
-partial indexes on the base platform tables, and schedules a 15-minute
+`sql/05_latest_observation_mv.sql` — it materialises both views, adds a
+selective partial index on the real table `silver.fact_product_reading` (the
+four `silver.blinkit/zepto/instamart/jiomart` relations are views over
+`silver.v_wide` and cannot be indexed), and schedules a 15-minute
 `CONCURRENTLY` refresh.
 
 **A Silver price question returns first-party ASP instead of the marketplace price.**

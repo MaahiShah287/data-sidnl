@@ -7,11 +7,12 @@
 -- Why:     Both views are `DISTINCT ON (...) ... FROM silver.v_all_platforms`.
 --          Postgres cannot push a brand / product / platform / store filter
 --          through a DISTINCT ON, so a filtered query rebuilds and sorts every
---          row in silver.v_all_platforms (a 4-branch UNION ALL over the Silver
---          platform tables; silver.blinkit alone is 245k rows and had no
---          indexes). Measured 8.9 s execution / 10.3 s wall for a simple
---          brand+platform price query, which trips the chatbot's 10 s
---          statement_timeout.
+--          row in silver.v_all_platforms. That relation is a 4-branch UNION ALL
+--          over silver.blinkit / zepto / instamart / jiomart, which are
+--          themselves views over silver.v_wide (a 6-way join whose physical
+--          fact table is silver.fact_product_reading, 260k rows). Measured
+--          8.9 s execution / 10.3 s wall for a simple brand+platform price
+--          query, which trips the chatbot's 10 s statement_timeout.
 --
 -- Fix:     Materialise the latest row per (platform, listing, store) once,
 --          index it, and point the two views at the materialised views. A
@@ -103,51 +104,31 @@ CREATE INDEX IF NOT EXISTS ix_mv_latest_shelf_brand_platform
 CREATE INDEX IF NOT EXISTS ix_mv_latest_shelf_platform_city
     ON silver.mv_latest_shelf_position (platform, city);
 
--- 2b. Base-table partial indexes (the inline fast path) ----------------------
--- v_all_platforms is a UNION ALL over the four Silver platform tables, and none
--- of them has an index today (silver.blinkit = 245k rows). A filtered
--- DISTINCT ON therefore falls back to a seq scan + sort of the whole table.
+-- 2b. Physical base-table index (the inline fast path) -----------------------
+-- silver.blinkit / zepto / instamart / jiomart are VIEWS over silver.v_wide,
+-- so they cannot be indexed. The physical table behind them is
+-- silver.fact_product_reading (260k rows). It already has
+-- ix_reading_prod_store_time (product_key, store_key, observed_at DESC), but
+-- that index is not restricted to the rows the latest observation view reads,
+-- so each product still fetches every reading (including the ~244k
+-- brand_search / category_shelf rows) before filtering.
 --
--- These indexes give the planner an already-ordered scan: brand and source_type
--- are equality predicates, then the DISTINCT ON key (listing, store) and
--- observed_at DESC are in index order, so no sort is needed and DISTINCT ON can
--- stop at the first row per group. One index per table covers both the
--- observation and shelf_position fast paths.
---
--- They keep the chatbot's inline rewrite fast even before this MV is applied
--- (and after, because the rewrite reads the base tables directly).
-CREATE INDEX IF NOT EXISTS ix_blinkit_latest_reading
-    ON silver.blinkit (brand, source_type,
-                       COALESCE(listing_id::text, platform_product_id),
-                       store_id, observed_at DESC)
-    WHERE data_quality_status = 'valid';
-
-CREATE INDEX IF NOT EXISTS ix_zepto_latest_reading
-    ON silver.zepto (brand, source_type,
-                     COALESCE(listing_id::text, platform_product_id),
-                     store_id, observed_at DESC)
-    WHERE data_quality_status = 'valid';
-
-CREATE INDEX IF NOT EXISTS ix_instamart_latest_reading
-    ON silver.instamart (brand, source_type,
-                         COALESCE(listing_id::text, platform_product_id),
-                         store_id, observed_at DESC)
-    WHERE data_quality_status = 'valid';
-
-CREATE INDEX IF NOT EXISTS ix_jiomart_latest_reading
-    ON silver.jiomart (brand, source_type,
-                       COALESCE(listing_id::text, platform_product_id),
-                       store_id, observed_at DESC)
-    WHERE data_quality_status = 'valid';
-
--- City-only questions (no brand) still benefit from a city-led index.
-CREATE INDEX IF NOT EXISTS ix_blinkit_city_source
-    ON silver.blinkit (city, source_type, observed_at DESC)
-    WHERE data_quality_status = 'valid';
-
-CREATE INDEX IF NOT EXISTS ix_zepto_city_source
-    ON silver.zepto (city, source_type, observed_at DESC)
-    WHERE data_quality_status = 'valid';
+-- IMPORTANT: the views expose the *mapped* source type, i.e.
+--   CASE source_type WHEN 'stock_check' THEN 'observation'
+--                     ELSE 'shelf_position' END
+-- Postgres does NOT simplify that back to `source_type = 'stock_check'`, so a
+-- partial index written with the plain column predicate would never be chosen.
+-- The predicate below uses the exact CASE expression the view inlines.
+-- The observation slice is only 16,127 rows (~6%), so this index is selective;
+-- the shelf slice is ~94% of the table, where the existing indexes/seq scan are
+-- already appropriate, so no shelf partial index is added.
+CREATE INDEX IF NOT EXISTS ix_reading_latest_observation
+    ON silver.fact_product_reading (product_key, store_key, observed_at DESC)
+    WHERE dq_status = 'valid'
+      AND (CASE source_type
+               WHEN 'stock_check' THEN 'observation'
+               ELSE 'shelf_position'
+           END) = 'observation';
 
 -- 3. Populate ----------------------------------------------------------------
 -- First population is non-concurrent (the MVs are empty, so CONCURRENTLY
@@ -233,12 +214,12 @@ $$;
 --   SELECT jobname, schedule, active FROM cron.job
 --    WHERE jobname LIKE 'refresh-mv-latest-%';
 --
---   -- Base-table partial indexes exist (expect 6):
---   SELECT tablename, indexname FROM pg_indexes
+--   -- Physical base-table partial index exists (expect 1):
+--   SELECT indexname FROM pg_indexes
 --    WHERE schemaname = 'silver'
---      AND (indexname LIKE 'ix_%_latest_reading'
---           OR indexname LIKE 'ix_%_city_source')
---    ORDER BY tablename, indexname;
+--      AND tablename = 'fact_product_reading'
+--      AND indexname LIKE 'ix_reading_latest_%'
+--    ORDER BY indexname;
 
 -- =============================================================================
 -- ROLLBACK (only if you need to go back to the slow view definitions)
@@ -259,6 +240,7 @@ $$;
 --
 -- SELECT cron.unschedule('refresh-mv-latest-observation');
 -- SELECT cron.unschedule('refresh-mv-latest-shelf-position');
+-- DROP INDEX IF EXISTS silver.ix_reading_latest_observation;
 -- DROP MATERIALIZED VIEW IF EXISTS silver.mv_latest_observation;
 -- DROP MATERIALIZED VIEW IF EXISTS silver.mv_latest_shelf_position;
 -- DROP FUNCTION IF EXISTS silver.refresh_latest_observation();
