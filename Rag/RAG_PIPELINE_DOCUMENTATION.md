@@ -115,7 +115,14 @@ Two layers fix it:
    refreshes the MVs every 15 minutes with `CONCURRENTLY`. This is the permanent
    fix for unfiltered reads and for any other client of the views; the chatbot
    role is read-only and
-   cannot create these objects, so the owner must run the script.
+   cannot create these objects, so the owner must run the script. The script is
+   split into six labelled phases (create MVs, base index, populate observation,
+   populate shelf, repoint/grants, cron) and must be run **one phase at a time**
+   in the Supabase SQL editor: the dashboard has an upstream gateway timeout, so
+   pasting the whole file fails even though each statement is fast (warm refresh
+   is ~0.9 s observation, ~7.9 s shelf). Use `psql` / the Supabase CLI to run the
+   file in one go, or the `pg_cron` fallback block in the script if a `REFRESH`
+   still times out in the editor.
 
 The metric templates for `current_price`, `observed_in_stock_rate`,
 `observed_oos_rate`, `avg_discount_pct`, `ad_placement_rate` and

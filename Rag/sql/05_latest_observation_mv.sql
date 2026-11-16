@@ -1,8 +1,25 @@
 -- =============================================================================
 -- File:    05_latest_observation_mv.sql
--- Purpose: RUN THIS ONE as postgres / Supabase SQL editor. Makes
---          silver.v_latest_observation and silver.v_latest_shelf_position fast
---          (target: < 200 ms) by materialising the DISTINCT ON.
+-- Purpose: Makes silver.v_latest_observation and silver.v_latest_shelf_position
+--          fast (target: < 200 ms) by materialising the DISTINCT ON.
+--
+-- HOW TO RUN IN THE SUPABASE SQL EDITOR
+-- -------------------------------------
+-- The dashboard has an upstream/gateway timeout, so DO NOT paste this whole
+-- file at once. Run the phases below ONE AT A TIME: select a phase, click Run,
+-- wait for "Success", then run the next phase.
+--
+--   Phase 1  create the two materialised views + their indexes   (instant)
+--   Phase 2  create the base-table partial index                 (~1-3 s)
+--   Phase 3  populate mv_latest_observation                      (~1-20 s)
+--   Phase 4  populate mv_latest_shelf_position                   (~8-30 s)
+--   Phase 5  analyze, repoint the public views, grant SELECT     (instant)
+--   Phase 6  schedule the 15-minute pg_cron refresh              (instant)
+--
+-- If Phase 3 or Phase 4 still times out in the dashboard, use the pg_cron
+-- fallback at the end: it runs the refresh server-side, so the editor returns
+-- immediately. Alternatively run the whole file with psql / the Supabase CLI,
+-- which has no dashboard gateway timeout.
 --
 -- Why:     Both views are `DISTINCT ON (...) ... FROM silver.v_all_platforms`.
 --          Postgres cannot push a brand / product / platform / store filter
@@ -18,9 +35,11 @@
 --          index it, and point the two views at the materialised views. A
 --          filtered lookup then becomes an index scan + small sort.
 --
--- Notes:   * The chatbot role sidnl_chatbot_app is read-only and cannot create
---            objects; table/view owner is `postgres`. Run this as the owner.
+-- Notes:   * Run as the owner (postgres). sidnl_chatbot_app is read-only.
 --          * Safe to re-run: CREATE ... IF NOT EXISTS, CREATE OR REPLACE VIEW.
+--          * CREATE INDEX (not CONCURRENTLY) is used so it works inside the
+--            SQL editor's implicit transaction; it briefly blocks writes to
+--            fact_product_reading (~1-3 s). Run Phase 2 at low traffic.
 --          * Refreshing CONCURRENTLY requires the unique indexes created below.
 --          * REFRESH MATERIALIZED VIEW CONCURRENTLY cannot run inside a
 --            function, so the pg_cron jobs call it as a top-level statement.
@@ -28,7 +47,12 @@
 --            default; tighten it if the pipeline finishes more often.
 -- =============================================================================
 
--- 1. Materialised views -------------------------------------------------------
+
+-- ############################################################################
+-- PHASE 1 — create the materialised views and their indexes
+-- ############################################################################
+SET statement_timeout = 0;
+
 CREATE MATERIALIZED VIEW IF NOT EXISTS silver.mv_latest_observation AS
 SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
        id, platform, source_type, source_record_id, listing_id, product_id,
@@ -75,7 +99,6 @@ ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
          observed_at DESC
 WITH NO DATA;
 
--- 2. Indexes ------------------------------------------------------------------
 -- Unique index is mandatory for REFRESH ... CONCURRENTLY.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_mv_latest_obs_key
     ON silver.mv_latest_observation
@@ -104,7 +127,12 @@ CREATE INDEX IF NOT EXISTS ix_mv_latest_shelf_brand_platform
 CREATE INDEX IF NOT EXISTS ix_mv_latest_shelf_platform_city
     ON silver.mv_latest_shelf_position (platform, city);
 
--- 2b. Physical base-table index (the inline fast path) -----------------------
+
+-- ############################################################################
+-- PHASE 2 — physical base-table partial index (the inline fast path)
+-- ############################################################################
+SET statement_timeout = 0;
+
 -- silver.blinkit / zepto / instamart / jiomart are VIEWS over silver.v_wide,
 -- so they cannot be indexed. The physical table behind them is
 -- silver.fact_product_reading (260k rows). It already has
@@ -130,15 +158,33 @@ CREATE INDEX IF NOT EXISTS ix_reading_latest_observation
                ELSE 'shelf_position'
            END) = 'observation';
 
--- 3. Populate ----------------------------------------------------------------
--- First population is non-concurrent (the MVs are empty, so CONCURRENTLY
--- would error with "materialized view has not been populated").
+
+-- ############################################################################
+-- PHASE 3 — populate mv_latest_observation (run alone)
+-- ############################################################################
+SET statement_timeout = 0;
+
+-- First population is non-concurrent (an unpopulated MV cannot be refreshed
+-- CONCURRENTLY). This is the heavy step; keep it in its own request.
 REFRESH MATERIALIZED VIEW silver.mv_latest_observation;
+
+
+-- ############################################################################
+-- PHASE 4 — populate mv_latest_shelf_position (run alone)
+-- ############################################################################
+SET statement_timeout = 0;
+
 REFRESH MATERIALIZED VIEW silver.mv_latest_shelf_position;
+
+
+-- ############################################################################
+-- PHASE 5 — analyze, repoint the public views, grant SELECT
+-- ############################################################################
+SET statement_timeout = 0;
+
 ANALYZE silver.mv_latest_observation;
 ANALYZE silver.mv_latest_shelf_position;
 
--- 4. Repoint the public views ------------------------------------------------
 -- Column list and types are identical, so CREATE OR REPLACE keeps every
 -- existing grant and dependent query working. (No dependent views exist today;
 -- verified with pg_depend.)
@@ -148,16 +194,15 @@ SELECT * FROM silver.mv_latest_observation;
 CREATE OR REPLACE VIEW silver.v_latest_shelf_position AS
 SELECT * FROM silver.mv_latest_shelf_position;
 
--- 5. Grants ------------------------------------------------------------------
 GRANT SELECT ON silver.mv_latest_observation TO sidnl_chatbot_app;
 GRANT SELECT ON silver.mv_latest_shelf_position TO sidnl_chatbot_app;
 GRANT SELECT ON silver.v_latest_observation TO sidnl_chatbot_app;
 GRANT SELECT ON silver.v_latest_shelf_position TO sidnl_chatbot_app;
 
--- 6. Manual refresh helper ---------------------------------------------------
--- Plain REFRESH takes a brief exclusive lock. For zero-downtime refreshes run
--- the CONCURRENTLY statements in section 7 as a top-level statement instead
--- (Postgres forbids CONCURRENTLY inside a function).
+-- Manual refresh helper (owner-only: REFRESH needs table ownership, so the
+-- read-only app role cannot call it and no EXECUTE grant is given). Plain
+-- REFRESH takes a brief exclusive lock; the pg_cron jobs below use CONCURRENTLY
+-- instead (Postgres forbids CONCURRENTLY inside a function).
 CREATE OR REPLACE FUNCTION silver.refresh_latest_observation()
 RETURNS void
 LANGUAGE plpgsql
@@ -168,11 +213,14 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION silver.refresh_latest_observation() TO sidnl_chatbot_app;
 
--- 7. Schedule the refresh with pg_cron (already installed on this database) --
+-- ############################################################################
+-- PHASE 6 — schedule the 15-minute pg_cron refresh
+-- ############################################################################
+SET statement_timeout = 0;
+
 -- Two jobs because cron.schedule takes one statement per job; CONCURRENTLY
--- keeps readers unblocked while the ~7-17 s refresh runs.
+-- keeps readers unblocked while the ~1-8 s warm refresh runs.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
@@ -199,8 +247,11 @@ BEGIN
 END;
 $$;
 
--- 8. Verify ------------------------------------------------------------------
--- Expect two rows, both freshly populated, and index scans below 200 ms:
+
+-- =============================================================================
+-- VERIFY (run after all phases)
+-- =============================================================================
+-- Expect two rows, both populated, and index scans below 200 ms:
 --
 --   SELECT relname, relispopulated FROM pg_class
 --    WHERE relname IN ('mv_latest_observation','mv_latest_shelf_position');
@@ -220,6 +271,33 @@ $$;
 --      AND tablename = 'fact_product_reading'
 --      AND indexname LIKE 'ix_reading_latest_%'
 --    ORDER BY indexname;
+
+
+-- =============================================================================
+-- FALLBACK — populate via pg_cron if Phase 3/4 still times out
+-- =============================================================================
+-- The editor returns immediately after scheduling; pg_cron runs the refresh
+-- server-side. Uncomment and run this block only if a REFRESH timed out.
+-- WARNING: '* * * * *' runs every minute until you unschedule it, so unschedule
+-- the temporary jobs as soon as both MVs are populated.
+--
+-- SELECT cron.schedule(
+--     'populate-mv-observation-once', '* * * * *',
+--     'REFRESH MATERIALIZED VIEW silver.mv_latest_observation');
+-- SELECT cron.schedule(
+--     'populate-mv-shelf-once', '* * * * *',
+--     'REFRESH MATERIALIZED VIEW silver.mv_latest_shelf_position');
+--
+-- Wait ~1 minute, then check:
+-- SELECT relname, relispopulated FROM pg_class
+--  WHERE relname IN ('mv_latest_observation','mv_latest_shelf_position');
+-- SELECT jobname, status, return_message, start_time
+--   FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
+--
+-- Once both are populated, unschedule the temporary jobs:
+-- SELECT cron.unschedule('populate-mv-observation-once');
+-- SELECT cron.unschedule('populate-mv-shelf-once');
+
 
 -- =============================================================================
 -- ROLLBACK (only if you need to go back to the slow view definitions)
