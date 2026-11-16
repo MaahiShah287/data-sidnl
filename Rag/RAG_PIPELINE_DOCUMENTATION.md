@@ -122,7 +122,13 @@ Two layers fix it:
    pasting the whole file fails even though each statement is fast (warm refresh
    is ~0.9 s observation, ~7.9 s shelf). Use `psql` / the Supabase CLI to run the
    file in one go, or the `pg_cron` fallback block in the script if a `REFRESH`
-   still times out in the editor.
+   still times out in the editor. Phase 2 is optional (the MVs are the real fix)
+   and must be submitted as a single `CREATE INDEX CONCURRENTLY` statement: a
+   plain `CREATE INDEX` takes a `SHARE` lock that conflicts with the loader's
+   `RowExclusiveLock`, so the ~1 s build sits in the lock queue and the dashboard
+   times out first. `CONCURRENTLY` does not block writes, but Postgres forbids it
+   inside a transaction block, so it cannot share a submission with `SET` or any
+   other statement; the script also shows a one-statement `pg_cron` fallback.
 
 The metric templates for `current_price`, `observed_in_stock_rate`,
 `observed_oos_rate`, `avg_discount_pct`, `ad_placement_rate` and

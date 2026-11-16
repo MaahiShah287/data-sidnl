@@ -10,7 +10,7 @@
 -- wait for "Success", then run the next phase.
 --
 --   Phase 1  create the two materialised views + their indexes   (instant)
---   Phase 2  create the base-table partial index                 (~1-3 s)
+--   Phase 2  OPTIONAL base-table index (one statement, see below)
 --   Phase 3  populate mv_latest_observation                      (~1-20 s)
 --   Phase 4  populate mv_latest_shelf_position                   (~8-30 s)
 --   Phase 5  analyze, repoint the public views, grant SELECT     (instant)
@@ -37,9 +37,10 @@
 --
 -- Notes:   * Run as the owner (postgres). sidnl_chatbot_app is read-only.
 --          * Safe to re-run: CREATE ... IF NOT EXISTS, CREATE OR REPLACE VIEW.
---          * CREATE INDEX (not CONCURRENTLY) is used so it works inside the
---            SQL editor's implicit transaction; it briefly blocks writes to
---            fact_product_reading (~1-3 s). Run Phase 2 at low traffic.
+--          * Phase 2 uses CREATE INDEX CONCURRENTLY, so it never blocks the
+--            Silver loader's inserts. It must be submitted as a SINGLE
+--            statement (no SET, nothing else) because Postgres forbids
+--            CONCURRENTLY inside a transaction block.
 --          * Refreshing CONCURRENTLY requires the unique indexes created below.
 --          * REFRESH MATERIALIZED VIEW CONCURRENTLY cannot run inside a
 --            function, so the pg_cron jobs call it as a top-level statement.
@@ -129,17 +130,26 @@ CREATE INDEX IF NOT EXISTS ix_mv_latest_shelf_platform_city
 
 
 -- ############################################################################
--- PHASE 2 — physical base-table partial index (the inline fast path)
+-- PHASE 2 (OPTIONAL) — physical base-table partial index (the inline fast path)
 -- ############################################################################
-SET statement_timeout = 0;
-
--- silver.blinkit / zepto / instamart / jiomart are VIEWS over silver.v_wide,
--- so they cannot be indexed. The physical table behind them is
--- silver.fact_product_reading (260k rows). It already has
--- ix_reading_prod_store_time (product_key, store_key, observed_at DESC), but
--- that index is not restricted to the rows the latest observation view reads,
--- so each product still fetches every reading (including the ~244k
--- brand_search / category_shelf rows) before filtering.
+-- SKIP THIS PHASE IF YOU ARE BLOCKED: the materialised views (Phases 3-6) are
+-- the fix for the public views. This index only shaves the app-side inline
+-- rewrite, which is already ~80-220 ms without it.
+--
+-- Why this phase is ONE statement, with no SET and no other SQL:
+--   * silver.blinkit / zepto / instamart / jiomart are VIEWS over silver.v_wide
+--     and cannot be indexed. The physical table is silver.fact_product_reading
+--     (260k rows, 154 MB). Its existing ix_reading_prod_store_time is not
+--     restricted to the rows the latest views read, so each product still
+--     fetches the ~244k brand_search / category_shelf rows before filtering.
+--   * A plain CREATE INDEX takes a SHARE lock, which conflicts with the
+--     RowExclusiveLock the Silver loader holds while inserting. The build is
+--     only ~1 s, but it waits in the lock queue until the loader's transaction
+--     ends, so the dashboard's upstream timeout fires first.
+--   * CREATE INDEX CONCURRENTLY only needs ShareUpdateExclusiveLock, which is
+--     compatible with inserts, so it does not block (or queue behind) the
+--     loader. Postgres refuses to run it inside a transaction block, so it
+--     must be submitted ALONE: no SET statement_timeout, no other statement.
 --
 -- IMPORTANT: the views expose the *mapped* source type, i.e.
 --   CASE source_type WHEN 'stock_check' THEN 'observation'
@@ -147,16 +157,64 @@ SET statement_timeout = 0;
 -- Postgres does NOT simplify that back to `source_type = 'stock_check'`, so a
 -- partial index written with the plain column predicate would never be chosen.
 -- The predicate below uses the exact CASE expression the view inlines.
--- The observation slice is only 16,127 rows (~6%), so this index is selective;
--- the shelf slice is ~94% of the table, where the existing indexes/seq scan are
--- already appropriate, so no shelf partial index is added.
-CREATE INDEX IF NOT EXISTS ix_reading_latest_observation
+-- The observation slice is 16,127 rows (~6%), so this index is selective; the
+-- shelf slice is ~94% of the table, where the existing indexes are already
+-- appropriate, so no shelf partial index is added.
+
+-- >>> SELECT ONLY THE NEXT STATEMENT, THEN RUN. Nothing else in the tab. <<<
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_reading_latest_observation
     ON silver.fact_product_reading (product_key, store_key, observed_at DESC)
     WHERE dq_status = 'valid'
       AND (CASE source_type
                WHEN 'stock_check' THEN 'observation'
                ELSE 'shelf_position'
            END) = 'observation';
+
+-- Verify (run separately). indisvalid must be true:
+--   SELECT c.relname AS index_name, i.indisvalid
+--     FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+--    WHERE c.relname = 'ix_reading_latest_observation';
+--
+-- If an earlier attempt left an INVALID index, drop it BY ITSELF, then re-run
+-- the CREATE INDEX CONCURRENTLY statement above:
+--   DROP INDEX CONCURRENTLY IF EXISTS silver.ix_reading_latest_observation;
+--
+-- A concurrent build still waits for transactions that already modified the
+-- table. If it hangs, look for a leaked idle-in-transaction session (as
+-- postgres) and terminate it only if it is stale:
+--   SELECT pid, state, now() - xact_start AS xact_age, left(query, 80)
+--     FROM pg_stat_activity
+--    WHERE datname = current_database() AND xact_start IS NOT NULL
+--    ORDER BY xact_start;
+--
+-- If the editor rejects CONCURRENTLY with
+--   "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
+-- (older dashboards wrap every submission in a transaction), or the request
+-- times out again, schedule the build with pg_cron instead. The job body must
+-- be ONE statement; the editor returns immediately and pg_cron builds the index
+-- server-side, so there is no dashboard timeout:
+--
+--   SELECT cron.schedule(
+--       'build-ix-reading-latest-observation',
+--       '* * * * *',
+--       $job$CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_reading_latest_observation
+--                ON silver.fact_product_reading (product_key, store_key, observed_at DESC)
+--               WHERE dq_status = 'valid'
+--                 AND (CASE source_type WHEN 'stock_check' THEN 'observation'
+--                                       ELSE 'shelf_position' END) = 'observation'$job$
+--   );
+--
+--   -- after ~1 minute:
+--   SELECT jobname, status, return_message, start_time
+--     FROM cron.job_run_details
+--    WHERE jobname = 'build-ix-reading-latest-observation'
+--    ORDER BY start_time DESC LIMIT 5;
+--
+--   -- once status = 'succeeded' and indisvalid = true, stop the every-minute job:
+--   SELECT cron.unschedule('build-ix-reading-latest-observation');
+--
+-- Or run the CREATE INDEX CONCURRENTLY statement with psql / the Supabase CLI,
+-- which have no dashboard gateway timeout.
 
 
 -- ############################################################################
