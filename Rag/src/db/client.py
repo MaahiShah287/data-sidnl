@@ -47,6 +47,73 @@ def get_conn() -> Generator:
 BULK_STATEMENT_TIMEOUT_MS = 600_000
 
 
+# ---------------------------------------------------------------------------
+# Latest-view materialisation detection
+# ---------------------------------------------------------------------------
+# silver.v_latest_observation / v_latest_shelf_position used to be DISTINCT ON
+# views over silver.v_all_platforms, so a filtered query scanned and sorted the
+# whole fact table (~9 s). db/silver_fast_path.py rewrites such queries to an
+# inline DISTINCT ON so the filter pushes down (~0.1-0.9 s).
+#
+# Once the owner script (Rag/sql/05_latest_observation_mv.sql) has populated the
+# materialised views and repointed the public views at them, the plain view is
+# much faster than that rewrite (~15-100 ms). This flag lets the app use the
+# views again. It is cached and fails safe: any error, missing object or
+# unpopulated MV keeps the rewrite, which still works on the base tables.
+_LATEST_MV_TTL_S = 300.0
+_latest_mv_cache: tuple[float, bool] | None = None
+
+_LATEST_MV_QUERY = """
+    SELECT count(*)
+      FROM (VALUES
+              ('silver.v_latest_observation', 'mv_latest_observation'),
+              ('silver.v_latest_shelf_position', 'mv_latest_shelf_position')
+           ) AS v(view_name, mv_name)
+     WHERE EXISTS (
+             SELECT 1
+               FROM pg_rewrite r
+               JOIN pg_depend d ON d.objid = r.oid
+               JOIN pg_class c ON c.oid = d.refobjid
+              WHERE r.ev_class = v.view_name::regclass
+                AND c.relkind = 'm'
+                AND c.relname = v.mv_name
+                AND c.relispopulated
+           )
+"""
+
+
+def latest_views_use_mv() -> bool:
+    """
+    True when both public latest views read a *populated* materialised view.
+
+    Cached for 5 minutes so a chat turn costs at most one cheap catalog query.
+    Returns False on any problem (no DATABASE_URL, permissions, missing
+    objects), so the DISTINCT ON rewrite stays the safe default.
+    """
+    global _latest_mv_cache
+    now = time.monotonic()
+    if _latest_mv_cache is not None and now - _latest_mv_cache[0] < _LATEST_MV_TTL_S:
+        return _latest_mv_cache[1]
+
+    ok = False
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_LATEST_MV_QUERY)
+                ok = cur.fetchone()[0] == 2
+    except Exception:
+        ok = False
+
+    _latest_mv_cache = (now, ok)
+    return ok
+
+
+def reset_latest_mv_cache() -> None:
+    """Clear the cached materialisation flag (tests / after an owner rollout)."""
+    global _latest_mv_cache
+    _latest_mv_cache = None
+
+
 @contextmanager
 def get_bulk_conn(timeout_ms: int = BULK_STATEMENT_TIMEOUT_MS) -> Generator:
     """
@@ -84,7 +151,11 @@ def execute_safe(raw_sql: str) -> SafeResult:
     - statement_timeout=10s via connection option.
     - No writes possible (read-only transaction).
     """
-    result = validate_and_sanitise(raw_sql)  # raises SQLValidationError if unsafe
+    # When the latest-observation materialised views are live, the plain views
+    # are 5-50x faster than the DISTINCT ON rewrite over the base tables.
+    result = validate_and_sanitise(
+        raw_sql, skip_fast_path=latest_views_use_mv()
+    )  # raises SQLValidationError if unsafe
 
     start = time.monotonic()
     try:

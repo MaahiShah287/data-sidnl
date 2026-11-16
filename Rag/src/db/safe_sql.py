@@ -212,7 +212,15 @@ def _has_limit(parsed: sqlglot.Expression) -> bool:
     return False
 
 
-def validate_and_sanitise(raw_sql: str) -> SafeResult:
+def validate_and_sanitise(raw_sql: str, *, skip_fast_path: bool = False) -> SafeResult:
+    """
+    Validate and sanitise one read-only SELECT.
+
+    skip_fast_path=True disables the deterministic DISTINCT ON rewrite. Callers
+    set it when silver.v_latest_observation / v_latest_shelf_position are backed
+    by populated materialised views, where the plain view is much faster than
+    the inline rewrite over the base tables (see db/client.py).
+    """
     if not raw_sql or not raw_sql.strip():
         raise SQLValidationError("Rejected: empty SQL.")
     sql = _strip_semi(raw_sql.strip())
@@ -221,7 +229,10 @@ def validate_and_sanitise(raw_sql: str) -> SafeResult:
     # v_latest_shelf_position is rewritten to an inline DISTINCT ON over
     # v_all_platforms so the filter is pushed down (see db/silver_fast_path.py).
     # The rewrite is semantic-preserving (scope columns only) and idempotent.
-    sql, rewritten = rewrite_latest_views(sql)
+    if skip_fast_path:
+        rewritten = False
+    else:
+        sql, rewritten = rewrite_latest_views(sql)
     _check_blocked(sql)
     parsed = _parse(sql)
     rels = _relations(parsed)
@@ -263,8 +274,10 @@ def validate_and_sanitise(raw_sql: str) -> SafeResult:
     )
 
 
-def validate_and_sanitise_safe(raw_sql: str) -> tuple[SafeResult | None, str | None]:
+def validate_and_sanitise_safe(
+    raw_sql: str, *, skip_fast_path: bool = False
+) -> tuple[SafeResult | None, str | None]:
     try:
-        return validate_and_sanitise(raw_sql), None
+        return validate_and_sanitise(raw_sql, skip_fast_path=skip_fast_path), None
     except SQLValidationError as exc:
         return None, str(exc)

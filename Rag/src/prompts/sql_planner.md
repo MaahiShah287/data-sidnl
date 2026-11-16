@@ -1,5 +1,5 @@
 # SQL Planner Prompt
-# Version: 2.1 — Silver fast path (inline DISTINCT ON); marketplace price ≠ first-party ASP
+# Version: 2.2 — Silver reads the latest materialised views; marketplace price ≠ first-party ASP
 # Used by: src/graph/sql_graph.py — plan_query node
 
 You generate a read-only Postgres SELECT statement to answer the user's question
@@ -10,20 +10,21 @@ readings) and the **Gold** layer (`dash` schema, pre-aggregated dashboard KPIs).
 
 ### Silver — raw, quality-filtered SKU x store readings
 - **silver.v_latest_observation** — price, availability, discount
-  (one row per platform+listing+store, source_type='observation';
-  `delivery_eta_minutes` exists but is NULL in every row, so never use it)
+  (one row per platform+listing+store, source_type='observation'; materialised,
+  refreshed every 15 minutes; `delivery_eta_minutes` exists but is NULL in
+  every row, so never use it)
 - **silver.v_latest_shelf_position** — position, is_ad, ad_type, organic_position
-  (one row per platform+listing+store, source_type='shelf_position')
-- **silver.v_all_platforms** — all rows, both source types, filtered to valid quality
+  (one row per platform+listing+store, source_type='shelf_position';
+  materialised, refreshed every 15 minutes)
+- **silver.v_all_platforms** — all rows, both source types, filtered to valid
+  quality (live base data; slower, use only for columns the latest views lack)
 
 **Silver performance rule — read this before writing Silver SQL.**
-`v_latest_observation` and `v_latest_shelf_position` are `DISTINCT ON` views
-over `silver.v_all_platforms`. Postgres cannot push a brand/product/platform/
-store filter through that `DISTINCT ON`, so a filtered query on either view
-scans and sorts every row (about 9 s — past the 10 s statement timeout). When
-the question filters by brand, product_name, platform, city or store, write
-the `DISTINCT ON` inline over `silver.v_all_platforms` and put **every** filter
-inside the subquery:
+`v_latest_observation` and `v_latest_shelf_position` are plain views over
+**materialised views** (`silver.mv_latest_observation`,
+`silver.mv_latest_shelf_position`) that a `pg_cron` job refreshes every 15
+minutes. Filter them freely — a brand/product/platform/city/store filter is
+pushed down and runs in ~15–100 ms:
 
 ```sql
 SELECT platform, city, product_name,
@@ -33,24 +34,27 @@ SELECT platform, city, product_name,
        MAX(sale_price)                      AS max_sale_price,
        MAX(mrp)                             AS mrp,
        MAX(observed_at)                     AS last_observed_at
-FROM (
-  SELECT DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)
-         platform, city, store_id, product_name, mrp, sale_price,
-         discount_percentage, availability, observed_at
-  FROM silver.v_all_platforms
-  WHERE source_type = 'observation'      -- 'shelf_position' for rank/ad questions
-    AND brand = 'Mr. Munchies'
-    AND platform = 'blinkit'
-  ORDER BY platform, COALESCE(listing_id::text, platform_product_id), store_id,
-           observed_at DESC
-) latest
+FROM silver.v_latest_observation
+WHERE brand = 'Mr. Munchies'
+  AND platform = 'blinkit'
 GROUP BY platform, city, product_name
 ORDER BY platform, city, product_name
 ```
 
-That pattern runs in about 150–220 ms. Use the plain views only for an
-unfiltered "latest everything" listing. The permanent fix (owner-run
-materialized view) is `Rag/sql/05_latest_observation_mv.sql`.
+Because the views are materialised, answers are **at most 15 minutes old**.
+That is the accepted freshness for Silver questions.
+
+Do **not** inline a `DISTINCT ON` over `silver.v_all_platforms` for these
+questions. That pattern still works (~0.1–0.9 s) and the application falls back
+to it automatically if the materialised views are missing or unpopulated, but
+it is 5–50× slower than the view and it reads live data the view already has.
+Use `silver.v_all_platforms` only when you need a column the two latest views
+do not expose, or a `source_type`-mixed listing.
+
+The owner-run definition of the materialised views is
+`Rag/sql/05_latest_observation_mv.sql`. Without a materialised view (or the
+fallback rewrite) a filtered read on the bare view exceeds the 10 s statement timeout,
+which is why this rule matters.
 
 **Marketplace price ≠ first-party sales.** For price, MRP, selling price,
 discount, stock or availability of a brand/SKU on Blinkit or Zepto, use the
@@ -251,10 +255,11 @@ and do not filter or group by date.
     (`v_fp_ad_wallet_day.ad_spend`) are the money actually spent; page spend
     (`v_fp_ad_page.spend`) is campaign-level reported spend. Use the wallet for
     "how much did we spend", the page for campaign ROAS/CTR.
-13. **Filtered Silver questions use the inline `DISTINCT ON` over
-    `silver.v_all_platforms`** (see the Silver performance rule). Never put a
-    brand/product/platform/store filter on `v_latest_observation` or
-    `v_latest_shelf_position`: that path takes about 9 s and times out.
+13. **Filtered Silver questions read `silver.v_latest_observation` /
+    `silver.v_latest_shelf_position` directly** (see the Silver performance
+    rule). They are materialised and refreshed every 15 minutes, so filters are
+    fast (~15–100 ms). Do not inline a `DISTINCT ON` over
+    `silver.v_all_platforms` for them.
 14. **Marketplace price ≠ first-party ASP.** A price/MRP/discount/stock
     question about a brand or SKU on Blinkit or Zepto is Silver; do not answer
     it from `dash.fp_sales_*` or the `asp` metric.

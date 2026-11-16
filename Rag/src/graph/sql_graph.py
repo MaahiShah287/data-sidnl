@@ -335,7 +335,12 @@ def validate_sql_node(state: ChatState) -> ChatState:
         return {**state, "trace": trace}
 
     try:
-        result = validate_and_sanitise(raw_sql)
+        # Match execute_safe: once the latest views read populated materialised
+        # views, keep queries on the (fast) views instead of rewriting them to
+        # the base tables.
+        from db.client import latest_views_use_mv
+
+        result = validate_and_sanitise(raw_sql, skip_fast_path=latest_views_use_mv())
         sanitised = result.sanitised_sql
         err = None
     except SQLValidationError as exc:

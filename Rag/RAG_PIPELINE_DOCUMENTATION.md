@@ -72,68 +72,68 @@ Three read-only Postgres views back the Silver path:
 
 | View | Rows | Grain |
 |---|---|---|
-| `silver.v_all_platforms` | ~56,249 | every row, both source types, quality-filtered |
-| `silver.v_latest_observation` | ~5,055 | latest price/availability/discount per listing+store |
-| `silver.v_latest_shelf_position` | ~33,991 | latest shelf position/ad data per listing+store |
+| `silver.v_all_platforms` | ~211,000 | every row, both source types, quality-filtered |
+| `silver.v_latest_observation` | ~8,100 | latest price/availability/discount per listing+store |
+| `silver.v_latest_shelf_position` | ~154,000 | latest shelf position/ad data per listing+store |
 
-**Performance: filtered reads on the two `v_latest_*` views.** Both views are a
-`DISTINCT ON (platform, listing, store) … ORDER BY … observed_at DESC` over
-`v_all_platforms`, which is a 4-branch `UNION ALL` over `silver.blinkit`,
+**Performance: filtered reads on the two `v_latest_*` views.** Both views used
+to be a `DISTINCT ON (platform, listing, store) … ORDER BY … observed_at DESC`
+over `v_all_platforms`, which is a 4-branch `UNION ALL` over `silver.blinkit`,
 `silver.zepto`, `silver.instamart`, `silver.jiomart`. Those four are **views**
 over `silver.v_wide`, a 6-way join whose physical fact table is
-`silver.fact_product_reading` (260k rows). Postgres cannot push a
-`brand`/`product`/`city` filter through a `DISTINCT ON`, so a filtered query
-rebuilds and sorts every row in the union. The fact table has indexes
-(`ix_reading_prod_store_time`, `ix_reading_source_time`, …), but none is
-restricted to the rows the latest views read, so each product still fetches
-every reading. That measured **8.9 s execution / 10.3 s wall**, tripping the
-10 s `statement_timeout`.
+`silver.fact_product_reading` (260k rows). Postgres could not push a
+`brand`/`product`/`city` filter through that `DISTINCT ON`, so a filtered query
+rebuilt and sorted every row in the union: measured **8.9 s execution / 10.3 s
+wall**, tripping the 10 s `statement_timeout`.
 
-Two layers fix it:
+Two layers fixed it, and both are now in place:
 
-1. **App-side deterministic rewrite** (`src/db/silver_fast_path.py`, called from
-   `validate_and_sanitise`). A single-table query on `v_latest_observation` /
-   `v_latest_shelf_position` that has at least one identity/scope predicate
-   (`brand`, `platform`, `city`, `store_id`, `product_name`, …) is rewritten to
-   an inline `DISTINCT ON` over `silver.v_all_platforms` with those predicates
-   **inside** the subquery, so the filter is pushed down. Value predicates
-   (`sale_price > 100`, `availability = true`, `observed_at`) stay outside to
-   preserve "latest row" semantics. The rewrite is idempotent, leaves unfiltered
-   or joined queries alone, and still passes the allowlist. Warm: **150–220 ms**
-   for brand+platform, **80–190 ms** for product+city.
-2. **Owner-run materialised views + physical base-table index**
-   (`sql/05_latest_observation_mv.sql`). Materialises each latest view once,
-   indexes it, repoints `v_latest_observation` / `v_latest_shelf_position` at
-   the MV, and adds one selective partial index on the real table
-   `silver.fact_product_reading`: `(product_key, store_key, observed_at DESC)
-   WHERE dq_status = 'valid' AND (CASE source_type WHEN 'stock_check' THEN
-   'observation' ELSE 'shelf_position' END) = 'observation'` (16k of 260k
-   rows). The `CASE` is deliberate: the views expose the mapped source type and
-   Postgres does not simplify it back to `source_type = 'stock_check'`, so a
-   plain-column predicate would never be chosen. The shelf slice is ~94% of the
-   table, where the existing indexes are already appropriate. A `pg_cron` job
-   refreshes the MVs every 15 minutes with `CONCURRENTLY`. This is the permanent
-   fix for unfiltered reads and for any other client of the views; the chatbot
-   role is read-only and
-   cannot create these objects, so the owner must run the script. The script is
-   split into six labelled phases (create MVs, base index, populate observation,
-   populate shelf, repoint/grants, cron) and must be run **one phase at a time**
-   in the Supabase SQL editor: the dashboard has an upstream gateway timeout, so
-   pasting the whole file fails even though each statement is fast (warm refresh
-   is ~0.9 s observation, ~7.9 s shelf). Use `psql` / the Supabase CLI to run the
-   file in one go, or the `pg_cron` fallback block in the script if a `REFRESH`
-   still times out in the editor. Phase 2 is optional (the MVs are the real fix)
-   and must be submitted as a single `CREATE INDEX CONCURRENTLY` statement: a
-   plain `CREATE INDEX` takes a `SHARE` lock that conflicts with the loader's
-   `RowExclusiveLock`, so the ~1 s build sits in the lock queue and the dashboard
-   times out first. `CONCURRENTLY` does not block writes, but Postgres forbids it
-   inside a transaction block, so it cannot share a submission with `SET` or any
-   other statement; the script also shows a one-statement `pg_cron` fallback.
+1. **Materialised views** (`sql/05_latest_observation_mv.sql`, owner-run).
+   `silver.mv_latest_observation` (~8,100 rows) and
+   `silver.mv_latest_shelf_position` (~154,000 rows) are indexed and the public
+   views `v_latest_observation` / `v_latest_shelf_position` are repointed at
+   them. A `pg_cron` job runs `REFRESH MATERIALIZED VIEW CONCURRENTLY` every 15
+   minutes (warm: ~0.9 s observation, ~7.9 s shelf). Filtered reads on the
+   public views now run in **15–100 ms**, and unfiltered reads are fast too.
+   Silver answers are therefore at most 15 minutes old — the accepted
+   freshness. The owner script also adds one optional selective partial index
+   on the real table `silver.fact_product_reading`:
+   `(product_key, store_key, observed_at DESC) WHERE dq_status = 'valid' AND
+   (CASE source_type WHEN 'stock_check' THEN 'observation' ELSE 'shelf_position'
+   END) = 'observation'` (16k of 260k rows). The `CASE` is deliberate: the views
+   expose the mapped source type and Postgres does not simplify it back to
+   `source_type = 'stock_check'`, so a plain-column predicate would never be
+   chosen. The shelf slice is ~94% of the table, where the existing indexes are
+   already appropriate. The chatbot role is read-only and cannot create these
+   objects, so the owner must run the script. It is split into six labelled
+   phases (create MVs, base index, populate observation, populate shelf,
+   repoint/grants, cron) and must be run **one phase at a time** in the Supabase
+   SQL editor: the dashboard has an upstream gateway timeout, so pasting the
+   whole file fails even though each statement is fast. Use `psql` / the
+   Supabase CLI to run the file in one go, or the `pg_cron` fallback block in
+   the script if a `REFRESH` still times out in the editor. Phase 2 is optional
+   (the MVs are the real fix) and must be submitted as a single
+   `CREATE INDEX CONCURRENTLY` statement: a plain `CREATE INDEX` takes a
+   `SHARE` lock that conflicts with the loader's `RowExclusiveLock`, so the
+   ~1 s build sits in the lock queue and the dashboard times out first.
+   `CONCURRENTLY` does not block writes, but Postgres forbids it inside a
+   transaction block, so it cannot share a submission with `SET` or any other
+   statement; the script also shows a one-statement `pg_cron` fallback.
+2. **App-side detection with an automatic fallback**
+   (`src/db/client.py::latest_views_use_mv`, called from `execute_safe` and
+   `validate_sql_node`). When both public views are backed by *populated*
+   materialised views, the deterministic `DISTINCT ON` rewrite
+   (`src/db/silver_fast_path.py`) is **skipped** so queries stay on the fast
+   views; `validate_and_sanitise(..., skip_fast_path=True)`. The check is a
+   cheap catalog query cached for 5 minutes and fails safe: any error, missing
+   object, unpopulated MV or un-repointed view keeps the rewrite, which still
+   runs in 80–900 ms on the base tables.
 
 The metric templates for `current_price`, `observed_in_stock_rate`,
 `observed_oos_rate`, `avg_discount_pct`, `ad_placement_rate` and
-`avg_organic_position` already use the inline pattern, and the planner prompt
-documents it ("Silver performance rule").
+`avg_organic_position` read `v_latest_observation` /
+`v_latest_shelf_position` directly, and the planner prompt documents the rule
+("Silver performance rule").
 
 The Gold path reads the curated `dash.*` tables/views directly. `dash` has 30
 tables and 25 views; `sql/01_views.sql` documents the map and
@@ -340,14 +340,17 @@ HTTP 413.
    `information_schema` into `src/db/dash_schema.py`, so `day` on
    `dash.v_fp_ad_page` is rejected before Postgres sees it, and the model is
    told the relation's real date columns (or that it has none);
-6. **rewrites filtered latest-view queries to the fast path**
-   (`src/db/silver_fast_path.py`): a single-table `SELECT` on
-   `silver.v_latest_observation` / `silver.v_latest_shelf_position` with a
+6. **keeps filtered latest-view queries on the fast materialised views**
+   (`src/db/client.py::latest_views_use_mv`, cached 5 minutes). When both
+   `silver.v_latest_observation` / `v_latest_shelf_position` read a *populated*
+   materialised view, `validate_and_sanitise(..., skip_fast_path=True)` is used
+   and no rewrite happens. Otherwise it falls back to
+   `src/db/silver_fast_path.py`: a single-table `SELECT` on either view with a
    scope predicate becomes an inline `DISTINCT ON` over
    `silver.v_all_platforms` with the predicate pushed into the subquery. Value
-   predicates stay outside so the "latest row" meaning is unchanged. The rewrite
-   is idempotent and leaves unfiltered/joined queries untouched. It sets
-   `SafeResult.rewritten_for_performance`;
+   predicates stay outside so the "latest row" meaning is unchanged. The
+   fallback is idempotent and leaves unfiltered/joined queries untouched. Either
+   way `SafeResult.rewritten_for_performance` records what happened;
 7. appends `LIMIT 200` if no limit is present.
 
 **execute_sql** — `src/db/client.py` runs the query through a connection pool
@@ -691,7 +694,7 @@ Rag/
 │   │   └── state.py           shared ChatState schema
 │   ├── db/
 │   │   ├── safe_sql.py        SQL firewall / Silver+Gold allowlist / LIMIT injection
-│   │   ├── silver_fast_path.py  inline DISTINCT ON rewrite for filtered latest views
+│   │   ├── silver_fast_path.py  inline DISTINCT ON fallback for filtered latest views
 │   │   ├── schema_guard.py    rejects impossible date columns on dash.* relations
 │   │   ├── dash_schema.py     generated: exact dash.* columns + date-column map
 │   │   └── client.py          read-only pool, 10 s timeout, bulk connection
@@ -735,19 +738,24 @@ col.query(...)         # returns hits
 If those work, the index is fine and the error is cosmetic. Do not re-embed.
 
 **A Silver price/stock question times out at 10 s (`QueryCanceled`).**
-The query is reading `silver.v_latest_observation` / `v_latest_shelf_position`
-through the `DISTINCT ON` instead of the fast path. Check the `sql` field: it
-should read `FROM silver.v_all_platforms` with the `DISTINCT ON` inlined and the
-brand/product/platform/city filter **inside** the subquery. If it still reads
-the view, the rewrite did not fire (no scope predicate, or a join). The
-deterministic rewrite lives in `src/db/silver_fast_path.py`; the metric
-templates in `metrics/metric_dictionary.yaml` use the same pattern. For a
-permanent fix (and unfiltered reads), have the owner run
-`sql/05_latest_observation_mv.sql` — it materialises both views, adds a
-selective partial index on the real table `silver.fact_product_reading` (the
-four `silver.blinkit/zepto/instamart/jiomart` relations are views over
+The materialised views are missing, unpopulated, or the public views were
+repointed back to `v_all_platforms`, *and* the deterministic fallback did not
+fire (no scope predicate, or a join). Check the `sql` field: either it reads
+`FROM silver.v_latest_observation` (fast, materialised) or it reads
+`FROM silver.v_all_platforms` with the `DISTINCT ON` inlined and the
+brand/product/platform/city filter **inside** the subquery (fallback, 80–900
+ms). If it reads the bare view and the query is slow, the MVs are not live:
+`db.client.latest_views_use_mv()` returned False. The detection lives in
+`src/db/client.py` (cached 5 minutes), the fallback rewrite in
+`src/db/silver_fast_path.py`, and the metric templates in
+`metrics/metric_dictionary.yaml` read the views directly. To restore the fast
+path, have the owner run `sql/05_latest_observation_mv.sql` — it materialises
+both views, adds a selective partial index on the real table
+`silver.fact_product_reading` (the four
+`silver.blinkit/zepto/instamart/jiomart` relations are views over
 `silver.v_wide` and cannot be indexed), and schedules a 15-minute
-`CONCURRENTLY` refresh.
+`CONCURRENTLY` refresh. Confirm with
+`SELECT jobname, schedule, active FROM cron.job WHERE jobname LIKE 'refresh-mv-latest-%';`.
 
 **A Silver price question returns first-party ASP instead of the marketplace price.**
 `asp` is Gold GMV/units; a Blinkit/Zepto price question must use the Silver

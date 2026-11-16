@@ -6,10 +6,11 @@ Two regressions are covered:
 1. "What is the price of Mr. Munchies on Blinkit?" was routed to UNSUPPORTED by
    the router LLM (price lives in Silver, not in the Gold metric catalog), so a
    deterministic rescue must send it to NUMERIC.
-2. Filtered Silver queries against silver.v_latest_observation take ~9 s
-   because the view's DISTINCT ON blocks predicate pushdown. The metric
-   templates and the planner prompt must use the inline DISTINCT ON over
-   silver.v_all_platforms fast path instead.
+2. Filtered Silver queries against silver.v_latest_observation used to take ~9 s
+   because the view's DISTINCT ON blocked predicate pushdown. The views are now
+   backed by materialised views (refreshed every 15 minutes), so the metric
+   templates and the planner prompt read them directly; the inline DISTINCT ON
+   over silver.v_all_platforms remains only as the automatic fallback.
 
 No LLM call is made: the router override is tested directly, and the node-level
 test replaces the router client with a stub.
@@ -155,24 +156,43 @@ SILVER_FAST_METRICS = [
     "avg_organic_position",
 ]
 
+# Which materialised-view-backed public view each metric reads.
+SILVER_METRIC_SOURCE = {
+    "observed_in_stock_rate": "silver.v_latest_observation",
+    "observed_oos_rate": "silver.v_latest_observation",
+    "avg_discount_pct": "silver.v_latest_observation",
+    "current_price": "silver.v_latest_observation",
+    "ad_placement_rate": "silver.v_latest_shelf_position",
+    "avg_organic_position": "silver.v_latest_shelf_position",
+}
+
 
 @pytest.mark.parametrize("name", SILVER_FAST_METRICS)
-def test_silver_templates_use_inline_distinct_on(name):
-    template = _metrics()[name]["sql_template"]
-    assert "DISTINCT ON (platform, COALESCE(listing_id::text, platform_product_id), store_id)" in template
-    assert "silver.v_all_platforms" in template
-    # The slow views must not be the source of a filtered Silver template.
-    assert "FROM silver.v_latest_observation" not in template
-    assert "FROM silver.v_latest_shelf_position" not in template
+def test_silver_templates_read_the_materialised_views(name):
+    metric = _metrics()[name]
+    template = metric["sql_template"]
+    source = SILVER_METRIC_SOURCE[name]
+    assert metric["source_view"] == source
+    assert f"FROM {source}" in template
+    # The inline DISTINCT ON over the base table is the fallback only; the
+    # metric templates must use the materialised views.
+    assert "DISTINCT ON" not in template
+    assert "silver.v_all_platforms" not in template
+    assert "source_type" not in template
 
 
 @pytest.mark.parametrize("name", SILVER_FAST_METRICS)
-def test_silver_template_filter_sits_inside_the_subquery(name):
+def test_silver_template_where_clauses_follow_the_view(name):
     template = _metrics()[name]["sql_template"]
     assert "{where_clauses}" in template
-    subquery = template.split("FROM silver.v_all_platforms", 1)[1]
-    before_order = subquery.split("ORDER BY", 1)[0]
-    assert "{where_clauses}" in before_order, "filter must push into the inline subquery"
+    # A single SELECT over the view: the filter placeholder comes after WHERE
+    # and before GROUP BY, with no subquery wrapper.
+    after_from = template.split(f"FROM {SILVER_METRIC_SOURCE[name]}", 1)[1]
+    where_pos = after_from.find("WHERE")
+    clauses_pos = after_from.find("{where_clauses}")
+    group_pos = after_from.find("GROUP BY")
+    assert -1 < where_pos < clauses_pos < group_pos
+    assert ") latest" not in template
 
 
 def test_current_price_rolls_up_to_city_and_product():
@@ -192,11 +212,12 @@ def test_current_price_sql_validates():
     assert result.limit_was_added is True
 
 
-def test_planner_prompt_documents_the_fast_path():
+def test_planner_prompt_documents_the_materialised_views():
     prompt = open(PLANNER_PROMPT_PATH, encoding="utf-8").read()
     assert "Silver performance rule" in prompt
-    assert "DISTINCT ON" in prompt
-    assert "silver.v_all_platforms" in prompt
+    assert "materialised view" in prompt
+    assert "v_latest_observation" in prompt
+    assert "v_all_platforms" in prompt
     assert "statement timeout" in prompt
 
 
@@ -299,6 +320,124 @@ def test_rewrite_still_enforces_the_allowlist():
             "WHERE brand = 'Amul' AND id IN (SELECT id FROM silver.blinkit)"
         )
     assert "allowlist" in str(exc.value).lower()
+
+
+def test_skip_fast_path_keeps_the_view_query():
+    result = validate_and_sanitise(FILTERED_VIEW_SQL, skip_fast_path=True)
+    assert result.rewritten_for_performance is False
+    assert "FROM silver.v_latest_observation" in result.sanitised_sql
+    assert "silver.v_all_platforms" not in result.sanitised_sql
+    assert result.limit_was_added is True
+
+
+def test_skip_fast_path_safe_wrapper_passes_the_flag_through():
+    from db.safe_sql import validate_and_sanitise_safe
+
+    result, err = validate_and_sanitise_safe(FILTERED_VIEW_SQL, skip_fast_path=True)
+    assert err is None and result is not None
+    assert result.rewritten_for_performance is False
+    assert "FROM silver.v_latest_observation" in result.sanitised_sql
+
+
+def test_skip_fast_path_does_not_relax_validation():
+    with pytest.raises(SQLValidationError) as exc:
+        validate_and_sanitise(
+            "DELETE FROM silver.v_latest_observation", skip_fast_path=True
+        )
+    assert "blocked" in str(exc.value).lower() or "expected select" in str(exc.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# Materialised-view detection (db.client.latest_views_use_mv)
+# ---------------------------------------------------------------------------
+
+class _FakeCursor:
+    def __init__(self, value):
+        self._value = value
+
+    def execute(self, *args, **kwargs):
+        pass
+
+    def fetchone(self):
+        return (self._value,)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, value):
+        self._value = value
+
+    def cursor(self):
+        return _FakeCursor(self._value)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _patch_mv_lookup(monkeypatch, value):
+    import db.client as client
+
+    client.reset_latest_mv_cache()
+    monkeypatch.setattr(client, "get_conn", lambda: _FakeConn(value))
+    return client
+
+
+def test_latest_views_use_mv_true_when_both_are_materialised(monkeypatch):
+    client = _patch_mv_lookup(monkeypatch, 2)
+    try:
+        assert client.latest_views_use_mv() is True
+    finally:
+        client.reset_latest_mv_cache()
+
+
+def test_latest_views_use_mv_false_when_only_one_is_materialised(monkeypatch):
+    client = _patch_mv_lookup(monkeypatch, 1)
+    try:
+        assert client.latest_views_use_mv() is False
+    finally:
+        client.reset_latest_mv_cache()
+
+
+def test_latest_views_use_mv_fails_safe(monkeypatch):
+    import db.client as client
+
+    client.reset_latest_mv_cache()
+
+    def _boom():
+        raise RuntimeError("no database")
+
+    monkeypatch.setattr(client, "get_conn", _boom)
+    try:
+        assert client.latest_views_use_mv() is False
+    finally:
+        client.reset_latest_mv_cache()
+
+
+def test_latest_views_use_mv_is_cached(monkeypatch):
+    import db.client as client
+
+    client.reset_latest_mv_cache()
+    calls = []
+
+    def _conn():
+        calls.append(1)
+        return _FakeConn(2)
+
+    monkeypatch.setattr(client, "get_conn", _conn)
+    try:
+        assert client.latest_views_use_mv() is True
+        assert client.latest_views_use_mv() is True
+        assert len(calls) == 1
+    finally:
+        client.reset_latest_mv_cache()
 
 
 # ---------------------------------------------------------------------------

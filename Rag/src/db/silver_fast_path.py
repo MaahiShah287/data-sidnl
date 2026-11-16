@@ -37,13 +37,20 @@ is semantically identical to filtering after it. Predicates on value columns
 (`sale_price > 100`, `availability = true`, `observed_at >= ...`) are NOT pushed
 down, because they would select a different "latest" row.
 
-The permanent fix is the owner-run materialized view in
-`Rag/sql/05_latest_observation_mv.sql`; this rewrite keeps the chatbot fast in
-the meantime. The owner script also adds a selective partial index on the real
-table `silver.fact_product_reading` (the four `silver.blinkit/zepto/...`
-relations are views), so the inline path stays fast after the views are
-repointed (the rewrite matches by view name, so it still fires and reads the
-base tables directly).
+Status
+------
+This is now the **fallback**, not the primary path. The owner script
+`Rag/sql/05_latest_observation_mv.sql` creates materialised views behind both
+public views (refreshed every 15 minutes by `pg_cron`). `db/client.py`'s
+`latest_views_use_mv()` detects that state and passes `skip_fast_path=True` to
+`safe_sql.validate_and_sanitise`, so filtered queries stay on the fast
+materialised views (~15-100 ms). If the MVs are missing, unpopulated or the
+public views are still on `v_all_platforms`, the rewrite below fires and keeps
+Silver queries well under the 10 s statement timeout (~0.1-0.9 s).
+
+The owner script also adds a selective partial index on the real table
+`silver.fact_product_reading` (the four `silver.blinkit/zepto/...` relations
+are views), so the inline fallback stays fast.
 """
 from __future__ import annotations
 
