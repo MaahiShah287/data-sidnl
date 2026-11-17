@@ -1,0 +1,44 @@
+# Zepto Brands portal (brands.zepto.co.in) - first-party report extraction config.
+# Companies (brand logins) are NOT listed here: they are onboarded with `python -m zepto_fp.run onboard`
+# and stored in ops.fp_accounts (passwords in the encrypted vault).
+#
+# Adding a report = adding an entry here. No code change needed.
+#   label         exact text of the option in Reports > Request Report > "Report Type" dropdown
+#   lookback_days days re-requested on every daily run (late updates: GRN, PO status, RTV...)
+#   max_days      longest window the portal accepts per request (the portal showed 31-day windows)
+#   key_columns   columns that identify a row across loads. Same key + same content = nothing stored;
+#                 same key + changed content = a new VERSION is appended (old one kept for analysis).
+#                 Leave empty until the real file headers have been seen; with no keys the whole
+#                 row is its identity, so a changed row simply appears as an additional row.
+#   enabled       false = skipped
+
+defaults:
+  lookback_days: 7
+  max_days: 31
+  request_timeout_min: 25      # how long to wait for a requested report to become "Completed"
+  poll_seconds: 20
+
+reports:
+  # --- listed in the portal's Request Report dropdown (observed 17 Nov 2026) ---
+  - {key: sales,            label: "Sales_F",                 key_columns: []}
+  - {key: fill_rate,        label: "Fill Rate",               key_columns: []}
+  - {key: deq_inventory,    label: "DEQ Inventory",           key_columns: [], lookback_days: 1}
+  - {key: oos_visibility,   label: "OOS Visibility",          key_columns: [], lookback_days: 3}
+  - {key: otif,             label: "OTIF",                    key_columns: []}
+  - {key: vendor_inventory, label: "Vendor Inventory_F",      key_columns: [], lookback_days: 1}
+  - {key: catalogue,        label: "Catalogue",               key_columns: [], lookback_days: 31}
+  - {key: odr,              label: "ODR",                     key_columns: []}
+  - {key: rtv,              label: "RTV",                     key_columns: [], lookback_days: 14}
+  - {key: odr_discrepancy,  label: "ODR_Discrepancy at IB",   key_columns: [], lookback_days: 14}
+  - {key: grn,              label: "GRN",                     key_columns: [], lookback_days: 14}
+  - {key: msl,              label: "MSL",                     key_columns: [], lookback_days: 1}
+  - {key: non_fbz_ledger,   label: "Non FBZ Sales Ledger",    key_columns: []}
+
+  # --- seen in the portal's request history but NOT in the dropdown ---
+  # PO, SCHEDULED_PO, UNSCHEDULED_PO and SALES_OVERVIEW were generated from elsewhere
+  # (probably the PO Management and Sales Analytics sections). Their request path has not been
+  # mapped yet, so they are disabled until the extractor for those sections is added.
+  - {key: po,               label: "PO",                      enabled: false}
+  - {key: scheduled_po,     label: "SCHEDULED_PO",            enabled: false}
+  - {key: unscheduled_po,   label: "UNSCHEDULED_PO",          enabled: false}
+  - {key: sales_overview,   label: "SALES_OVERVIEW",          enabled: false}

@@ -1,0 +1,5 @@
+# Linux/VM: runs every active company, every enabled report, at 07:00 and 19:00 India time.
+# Install with: crontab deploy/crontab.txt   (edit the path first)
+CRON_TZ=Asia/Kolkata
+0 7  * * * cd /opt/zepto_fp && /opt/zepto_fp/.venv/bin/python -m zepto_fp.run fetch --mode daily >> logs/fetch.log 2>&1
+0 19 * * * cd /opt/zepto_fp && /opt/zepto_fp/.venv/bin/python -m zepto_fp.run fetch --mode daily >> logs/fetch.log 2>&1
